@@ -1,0 +1,196 @@
+---
+title: "Survival Analysis"
+author: "Yingnan He"
+date: "2025-05-06"
+output: html_document
+---
+
+An example survival analysis is provided for the diabetes mellitus type 2 (DM2) reference group. Similar analyses were performed for other diseases.
+
+```{r setup, include=FALSE}
+library(survival)
+library(survey)
+
+library(dplyr)
+library(data.table)
+
+library(ggplot2)
+library(survminer)
+
+library(readxl)
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+```
+
+Define the function to process the data and perform the survival analysis.
+
+```{r}
+process_data <- function(drug) {
+
+  Disease <- fread('../b-DM2/DM2-Pat-ADRD.csv')
+  Disease <- unique(Disease, by = c("PAT_ID", "CONTACT_DATE"))
+  PAT <- Disease[PAT, on = "PAT_ID", .(PAT_ID, DM2_Dx_Date, BIRTH_DATE, DEATH_DATE, SEX_C, AGEATDXDATE, LATEST_CONTACT_DATE, Event_Disease_Date = CONTACT_DATE)]
+  PAT[, event := fifelse(!is.na(Event_Disease_Date), 1, 0)]
+  PAT <- PAT[AGEATDXDATE > 50]
+
+  # Medication data processing
+  med <- fread('../b-DM2/DM2-Pat-Meds.csv')
+
+  # Filter medication data for the specified drug
+  filtered_df <- med[grepl(drug, DESCRIPTION, ignore.case = TRUE)]
+  setorder(filtered_df, PAT_ID, START_DATE)
+  filtered_df <- filtered_df[!duplicated(PAT_ID)]
+
+  # Merging medication data with the patient data
+  PAT <- filtered_df[PAT, on = 'PAT_ID', .(PAT_ID, DM2_Dx_Date, BIRTH_DATE, DEATH_DATE, SEX_C, AGEATDXDATE, LATEST_CONTACT_DATE, Event_Disease_Date, event, MED_START_DATE = START_DATE)]
+
+  # Define censor date
+  PAT[, censor_date := fifelse(
+    !is.na(DEATH_DATE) & DEATH_DATE < LATEST_CONTACT_DATE,
+    DEATH_DATE,
+    LATEST_CONTACT_DATE)]
+
+  # Define end date based on disease event or censor date
+  PAT[, end_date := fifelse(!is.na(Event_Disease_Date), Event_Disease_Date, censor_date)]
+
+  # Define start date based on medication start date or disease diagnosis date
+  PAT[, start_date := fifelse(!is.na(MED_START_DATE), MED_START_DATE, DM2_Dx_Date)]
+
+  # Calculate follow-up time in days and years
+  PAT[, follow_up_time_days := as.numeric(difftime(end_date, start_date, units = "days"))]
+  PAT[, follow_up_time_years := follow_up_time_days / 365]
+
+  # Define the MED column (1 if treated, 0 if not)
+  PAT[, MED := fifelse(!is.na(MED_START_DATE), 1, 0)]
+
+  # Calculate age at start date
+  PAT[, age_at_start_date := as.numeric(difftime(start_date, BIRTH_DATE, units = "days")) %/% 365]
+
+  # Keep rows where follow-up time is positive
+  PAT <- PAT[follow_up_time_days >= 0]
+
+  # Fit IPTW model and calculate propensity score
+  iptw_model <- glm(MED ~ age_at_start_date + SEX_C, family = binomial, data = PAT)
+  PAT$propensity_score <- predict(iptw_model, type = "response")
+  PAT$iptw <- ifelse(PAT$MED == 1, 1 / PAT$propensity_score, 1 / (1 - PAT$propensity_score))
+
+  # Fit the Cox model with IPTW as weights
+  cox_model <- coxph(Surv(follow_up_time_days, event) ~ MED + age_at_start_date + SEX_C,
+                     data = PAT, weights = iptw)
+  model_summary <- summary(cox_model)
+
+  # Extract the coefficients data
+  coefficients <- model_summary$coefficients
+  HR <- model_summary$conf.int
+  flattened_coeffs <- data.frame()
+
+  # Loop through each variable and extract the statistics
+  for (var in rownames(coefficients)) {
+    flattened_coeffs[disease,paste0(var, "_coef")] <- coefficients[var, "coef"]
+    flattened_coeffs[disease,paste0(var, "_exp")] <- coefficients[var, "exp(coef)"]
+    flattened_coeffs[disease,paste0(var, "_hr_lower")] <- HR[var, "lower .95"]
+    flattened_coeffs[disease,paste0(var, "_hr_upper")] <- HR[var, "upper .95"]
+    flattened_coeffs[disease,paste0(var, "_se")] <- coefficients[var, "se(coef)"]
+    flattened_coeffs[disease,paste0(var, "_robust_se")] <- coefficients[var, "robust se"]
+    flattened_coeffs[disease,paste0(var, "_z")] <- coefficients[var, "z"]
+    flattened_coeffs[disease,paste0(var, "_p_value")] <- coefficients[var, "Pr(>|z|)"]
+  }
+
+  flattened_coeffs <- as.data.table(flattened_coeffs)
+  flattened_coeffs[, Indication := 'DM2']
+  flattened_coeffs[, Category := disease]
+  flattened_coeffs[, `Drug Name` := drug]
+
+  total_control <- nrow(PAT[MED == 0])  # Control group (no medication)
+  total_treatment <- nrow(PAT[MED == 1])  # Treatment group (taking the drug)
+
+  control_adrd <- nrow(PAT[MED == 0 & event == 1])  # Control group with ADRD
+  treatment_adrd <- nrow(PAT[MED == 1 & event == 1])  # Treatment group with ADRD
+
+  flattened_coeffs[, `Total Control` := total_control]
+  flattened_coeffs[, `Total Treatment` := total_treatment]
+  flattened_coeffs[, `Control Event` := control_adrd]
+  flattened_coeffs[, `Treatment Event` := treatment_adrd]
+
+  write.csv(flattened_coeffs, file = paste0("../result/csv/DM2_",disease,"_", drug, "_results.csv"), row.names = FALSE)
+
+  # Fit Kaplan-Meier model
+  km_fit <- survfit(Surv(follow_up_time_years, event) ~ MED, data = PAT)
+
+  grid.draw.ggsurvplot <- function(x){
+    survminer:::print.ggsurvplot(x, newpage = FALSE)
+  }
+
+  surv_plot <- ggsurvplot(
+    km_fit,
+    data = PAT,
+    risk.table = TRUE,
+    pval = TRUE,
+    conf.int = TRUE,
+    legend.title = "Treatment",
+    legend.labs = c("Control", drug),
+    xlab = "Years",
+    ylab = paste0("Probability of ADRD-free survival"),
+    ggtheme = theme_minimal() + theme(panel.background = element_rect(fill = "white")),
+    ylim = c(0.85, 1),
+    xlim = c(0, 5),
+    break.x.by = 1,
+    risk.table.fontsize = 4.5,
+    font.x = 14,
+    font.y = 14,
+    font.tickslab = 12,
+    font.legend = 12,
+    risk.table.y.text = 8,
+    risk.table.x.text = 8
+  )
+
+  ggsave(paste0("../result/plot/DM2_", disease,"_",drug, "_survival_plot.png"), surv_plot, width = 6, height = 6, dpi = 300)
+
+  if(drug == "Dapagliflozin") {
+    fwrite(PAT, paste0("../result/KM_data/DM2_", disease,"_",drug, "_KM.csv"))
+  }
+}
+
+```
+
+Run the survival analysis for each drug.
+
+```{r}
+DT <- read_excel('../Summary of to-do query.xlsx')
+DT <- as.data.table(DT)
+DT <- DT[`Indication Category` == 'DM2']
+DT <- DT[`Category` == 'AD']
+
+med <- fread('../b-DM2/DM2-Pat-Meds.csv')
+unique_pairs <- unique(DT[, .(`Drug Name`, `Category`)])
+unique_pairs <- unique_pairs[sapply(`Drug Name`, function(drug) any(grepl(tolower(drug), unique(tolower(med$DESCRIPTION)))))]
+
+for (i in 1:nrow(unique_pairs)) {
+  drug <- unique_pairs[i, `Drug Name`]
+
+  print(paste("Processing for drug:", drug))
+
+  PAT <- fread('../b-DM2/PAT.csv')
+  PAT <- unique(PAT, by = c("PAT_ID", "FIRSTDXDATE"))
+  PAT[SEX_C == 1, SEX_C := 0]
+  PAT[SEX_C == 2, SEX_C := 1]
+
+  ENC <- fread('../b-DM2/DM2-Pat-Latest-Encs.csv')
+  ENC <- unique(ENC, by = c("PAT_ID", "LATEST_CONTACT_DATE"))
+  PAT <- ENC[PAT, on = 'PAT_ID', .(PAT_ID, DM2_Dx_Date = FIRSTDXDATE, BIRTH_DATE, DEATH_DATE, SEX_C, AGEATDXDATE, LATEST_CONTACT_DATE)]
+
+  # Define the treatment group
+  treatment <- PAT[PAT_ID %in% med[grepl(tolower(drug), tolower(DESCRIPTION)), PAT_ID]]
+
+  # Identify patients who did not take the specified drug
+  med_without_certain_drug <- med[!PAT_ID %in% treatment$PAT_ID]
+
+  # Define control group as patients with no medication records
+  controls <- PAT[!PAT_ID %in% med$PAT_ID]
+
+  PAT <- rbind(controls, treatment)
+  process_data(drug)
+}
+```

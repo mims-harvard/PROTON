@@ -1,0 +1,229 @@
+logging:
+  version: 1
+  disable_existing_loggers: False
+  formatters:
+    simple:
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers:
+    console:
+      class: logging.StreamHandler
+      level: INFO
+      formatter: simple
+      stream: ext://sys.stdout
+    info_file_handler:
+      class: logging.handlers.RotatingFileHandler
+      level: INFO
+      formatter: simple
+      filename: info.log
+      maxBytes: 10485760 # 10MB
+      backupCount: 20
+      encoding: utf8
+      delay: True
+    rich_handler:
+      class: src.cli.RichHandler
+      rich_tracebacks: True
+      tracebacks_show_locals: False
+  loggers:
+    src:
+      level: INFO
+    cli:
+      level: INFO
+    notebooks:
+      level: INFO
+  root:
+    level: INFO
+    handlers: [rich_handler, info_file_handler]
+
+paths:
+
+  kg:
+    base_dir: "data/neurokg"
+    nodes_path: "nodes.csv"
+    edges_path: "edges.csv"
+
+  checkpoint:
+    base_dir: "data/checkpoints"
+    checkpoint_path: "model.ckpt"
+    embeddings_path: "embeddings.pt"
+
+  mappings:
+    base_dir: "data/mappings"
+    hgnc_path: "hgnc_complete_set_2024.txt"
+    drug_path: "drug-mappings.tsv"
+    mondo_efo_path:  "mondo_efo_mappings.tsv"
+
+
+  notebooks:
+    base_dir: "data/notebooks"
+
+    asyn_screens: "parkinson_data/alpha_synuclein_screens.xlsx"
+    pd_related_genes: "parkinson_data/pd_related_genes.xlsx"
+    pesticide_lists: "parkinson_data/pwas_pesticides.xlsx"
+
+    private_ehr_dir: ""
+    gwas_catalog: "essentiality_gwas/gwas_catalog"
+
+    drug_repurposing_dir: "drug_repurposing"
+    cohort_analysis_dir: "cohort_analysis"
+    asyn_screens_dir: "alpha_synuclein_screens"
+    kg_viz_dir: "kg_visualization"
+    essentiality_gwas_dir: "essentiality_gwas"
+    organoid_validation_dir: "organoid_validation"
+    pesticide_prediction_dir: "pesticide_prediction"
+
+  embeddings_cache_path: "data/embeddings/BERT_disease_embeddings.npy"
+  splits_dir: "data/disease_splits"
+  split_emb_dir: "data/checkpoints/disease_splits"
+  secrets_path: "secrets.env"
+  mondo_obo_path: "data/mondo/mondo.obo"
+  pqa_prompts_dir: "data/neurokg/4_analyze_kg/pqa_prompts"
+  pqa_results_dir: "data/neurokg/4_analyze_kg/pqa_results"
+  sweep_output_dir: "data/sweep"
+  wandb_save_dir: "data/wandb/"
+  explainer_dir: "data/explainer"
+
+neurokg:
+  dataverse_base_url: "https://dataverse.harvard.edu/api"
+  dataverse_persistent_id: "doi:10.7910/DVN/ZDLS3K"
+
+  full_kg: false
+  test_set: null
+
+proton:
+  huggingface_repository: "mims-harvard/PROTON"
+
+  tunable_params:
+    num_feat: 1024
+    num_heads: 4
+    hidden_dim: 256
+    output_dim: 128
+    lr: 0.0001995980806038144
+    wd: 0.000057998609142972726
+    dropout_prob: 0.4546844003628963
+    max_epochs: -1
+
+  fixed_params:
+    kg: "NeuroKG"
+    num_layers: 3
+    pred_threshold: 0.5
+    sampler_fanout: [1, 1, 1]
+    fixed_k: 100
+    negative_k: 1
+    grad_clip: 1.0
+    lr_factor: 0.3333333333333333
+    lr_total_iters: 10
+    eps: 1.0e-8
+
+  training:
+    batch_sizes:
+      train_batch_size: 512
+      val_batch_size: 512
+      test_batch_size: 512
+    graph_sampling:
+      subsample_graph: false
+      degree_threshold: 4000
+    edge_sets:
+      edge_set: "hidden"
+    output_options:
+      save_embeddings: false
+      save_embedding_layer: false
+      save_decoder: false
+      debug: false
+    time_limit: "02:20:00:00"
+    num_workers: 0
+    log_every_n_steps: 10
+    time: false
+    verbose: true
+    sample_subgraph: false
+    seed_node: 1
+    n_walks: 100
+    walk_length: 10
+    profiler: null
+    resume: null
+
+wandb:
+  pretrain_project_name: "proton-pretraining"
+  splits_project_name: "proton-disease-splits"
+  finetune_project_name: "proton-finetuning"
+  entity_name: "ayushnoori"
+
+splits:
+  model_name: "emilyalsentzer/Bio_ClinicalBERT"
+  batch_size: 32
+  embedding_threshold: 0.98
+  levenshtein_threshold: 80
+  neighborhood_threshold: 0.1
+  disease_split:
+
+    # Nervous system disorders
+    "Alzheimer disease": 42049
+    "amyotrophic lateral sclerosis": 36436
+    "brain astrocytoma": 40807
+    "brain glioblastoma": 43561
+    "brain meningioma": 40651
+    "brain oligodendroglioma": 39411
+    "cerebral malaria": 95950
+    "diabetic neuropathy": 39898
+    "Down syndrome": 34970
+    "encephalitis": 40161
+    "ependymoma": 37167
+    "epilepsy": 39348
+    "Guillain-Barre syndrome": 43536
+    "Huntington disease": 29909
+    "Klinefelter syndrome": 95869
+    "medulloblastoma": 34930
+    "meningitis": 39713
+    "migraine": 41643
+    "multiple sclerosis": 41591
+    "neurosyphilis": 39291
+    "Parkinson disease": 39579
+    "stroke disorder": 37303
+
+    # Neuropsychiatric conditions
+    "anorexia nervosa": 44146
+    "anxiety disorder": 39774
+    "attention deficit-hyperactivity disorder": 30058
+    "autism spectrum disorder": 41585
+    "bipolar disorder": 39528
+    "bulimia nervosa": 43111
+    "dysthymic disorder": 95510
+    "major depressive disorder": 43130
+    "schizophrenia": 32652
+
+    # Rare diseases
+    "Alexander disease": 34836
+    "Charcot-Marie-Tooth disease": 42141
+    "progressive supranuclear palsy": 36648
+    "craniopharyngioma": 36285
+    "X-linked dystonia-parkinsonism": 29155
+
+explainer:
+  lr: 0.01
+  num_epochs: 10000
+  sparsity_loss_alpha: 1e-8
+  entropy_loss_alpha: 0
+  khop: 2
+  degree_threshold: 100000
+  query_edge_types:
+    - ["disease", "indication", "drug"]
+  src_indices:
+    - 39528
+  dst_indices:
+    - 14637
+
+finetune:
+  dataset: "disease-gene"
+  finetune_ckpt: null
+  random_baseline: false
+
+sweep:
+  wandb_path: "ayushnoori/proton-pretraining/sweeps/kxvnsxxu"
+  wandb_runs_path: "ayushnoori/proton-pretraining/runs"
+
+misc_figures:
+  seed_indices:
+    "Alzheimer's disease": 42049
+    "bipolar disorder": 39528
+    "Parkinson's disease": 39579
+
+seed: 42

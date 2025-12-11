@@ -1,0 +1,1013 @@
+---
+title: Enrich Knowledge Graph with scRNA-seq Data
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# plotting library
+library(ggplot2)
+
+# relative file paths
+library(here)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+primeKG_dir = here("data", "primekg")
+neuroKG_dir = here("data", "neurokg")
+cell_type_dir = here("data", "scrnaseq", "linnarsson", "processed")
+```
+
+# Read Data
+
+First, read in NeuroKG intermediate objects from `1_filter_kg.Rmd`.
+
+```{r read-neurokg}
+# read NeuroKG filtered for brain anatomy
+neuroKG_nodes = readRDS(here(neuroKG_dir, "1_filter_kg", "neuroKG_nodes.RDS"))
+neuroKG_edges = readRDS(here(neuroKG_dir, "1_filter_kg", "neuroKG_edges.RDS"))
+
+# print number of nodes and edges
+message("Original NeuroKG Nodes:\t", nrow(neuroKG_nodes))
+message("Original NeuroKG Edges:\t", nrow(neuroKG_edges) / 2)
+```
+
+Next, read in metadata of analyzed scRNA-seq data from Linnarsson *et al.*. Remember that:
+* Supercluster markers (*i.e.*, markers that define each supercluster, or cell type) are stored in `supercluster_markers.csv`.
+* Cluster markers (*i.e.*, markers that define clusters within each cell type) are stored in `<supercluster_name>_markers.csv`.
+* Subcluster markers (*i.e.*, markers that define subclusters within each cluster) for cluster $n$ are stored in `cluster_n_markers.csv`.
+
+```{r read-linnarsson}
+# read for 2.4M neurons
+# neurons_genes = fread(here(cell_type_dir, "neurons_var_gene_metadata.csv"))
+neurons_cells = fread(here(cell_type_dir, "neurons_obs_cell_metadata.csv"))
+
+# read for 885K non neurons
+# non_neurons_genes = fread(here(cell_type_dir, "non_neurons_var_gene_metadata.csv"))
+non_neurons_cells = fread(here(cell_type_dir, "non_neurons_obs_cell_metadata.csv"))
+
+# get list of neuronal superclusters and clusters
+neuron_marker_files = list.files(here(cell_type_dir, "neuron_markers"), pattern = "_markers\\.csv$")
+neuron_subcluster_marker_files = neuron_marker_files[grepl("^cluster.*", neuron_marker_files)]
+neuron_cluster_marker_files = neuron_marker_files[!grepl("(^cluster.*)|(^supercluster.*)", neuron_marker_files)]
+
+# get list of non-neuronal superclusters and clusters
+non_neuron_marker_files = list.files(here(cell_type_dir, "non_neuron_markers"), pattern = "_markers\\.csv$")
+non_neuron_subcluster_marker_files = non_neuron_marker_files[grepl("^cluster.*", non_neuron_marker_files)]
+non_neuron_cluster_marker_files = non_neuron_marker_files[!grepl("(^cluster.*)|(^supercluster.*)", non_neuron_marker_files)]
+
+# functions to get names of files
+get_supercluster_names = function(supercluster_files) { gsub("_markers\\.csv$", "", supercluster_files) }
+get_cluster_names = function(cluster_files) { map_chr(cluster_files, ~paste("cluster", strsplit(.x, "_")[[1]][2])) }
+
+# set names
+names(neuron_cluster_marker_files) = get_supercluster_names(neuron_cluster_marker_files)
+names(neuron_subcluster_marker_files) = get_cluster_names(neuron_subcluster_marker_files)
+names(non_neuron_cluster_marker_files) = get_supercluster_names(non_neuron_cluster_marker_files)
+names(non_neuron_subcluster_marker_files) = get_cluster_names(non_neuron_subcluster_marker_files)
+
+# Get counts
+neurons_counts = neurons_cells[, .(
+    total_cells = sum(.N),
+    num_clusters = uniqueN(cluster_id),
+    num_subclusters = uniqueN(subcluster_id)
+), by = "supercluster_term"][order(-total_cells)]
+
+non_neurons_counts = non_neurons_cells[, .(
+    total_cells = sum(.N),
+    num_clusters = uniqueN(cluster_id),
+    num_subclusters = uniqueN(subcluster_id)
+), by = "supercluster_term"][order(-total_cells)]
+
+# neurons_counts = neurons_cells[, .N, by = c("supercluster_term", "cluster_id", "subcluster_id")]
+# non_neurons_counts = non_neurons_cells[, .N, by = c("supercluster_term", "cluster_id", "subcluster_id")]
+```
+
+For each cell type, calculate the proportion of brain regions that the cell type is present in (by number of cells). Then, construct edges between that cell type and the top 5 brain regions present in that brain region.
+
+```{r calculate-proportions}
+# subset table for neurons
+neuron_cluster_region = neurons_cells[, .(ROIGroupFine, roi, dissection, tissue_ontology_term_id, supercluster_term, cell_type_ontology_term_id, cluster_id, subcluster_id)] %>%
+  .[, Dataset := "Neuron"]
+
+# subset table for non-neurons
+non_neuron_cluster_region = non_neurons_cells[, .(ROIGroupFine, roi, dissection, tissue_ontology_term_id, supercluster_term, cell_type_ontology_term_id, cluster_id, subcluster_id)] %>%
+  .[, Dataset := "Non-Neuron"]
+
+# combine two data frames
+cluster_region = rbind(neuron_cluster_region, non_neuron_cluster_region)
+
+# make mapping from ROI to human readable names manually
+roi_label_mapping = unique(cluster_region[, .(roi, dissection)])
+
+# function to clean dissection name
+clean_dissection = function(dissection) {
+  split = strsplit(dissection, " - ")[[1]]
+  label = split[length(split) - 1]
+  label = tolower(label)
+  if(length(label) == 1) return(label) else return(NA)
+}
+roi_label_mapping[, label := map(dissection, clean_dissection)]
+
+# don't overwrite!
+# fwrite(roi_label_mapping, here(neuroKG_dir, "2_enrich_kg", "roi_to_label_mapping.csv"))
+roi_label_mapping = fread(here(neuroKG_dir, "2_enrich_kg", "roi_to_label_mapping.csv"))
+
+# to check, see roi_label_mapping[roi %in% roi_label_mapping[duplicated(roi), roi]
+roi_label_mapping = unique(roi_label_mapping[, .(roi, label)])
+
+# dissection column is messy, so drop
+# check, for example, as.data.table(tstrsplit(neuron_cluster_region$dissection, " - ", fixed = TRUE))
+cluster_region[, dissection := NULL]
+
+# get brain region to ROI mapping
+region_to_roi = cluster_region %>%
+  .[, .(ROIGroupFine, roi)] %>%
+  unique()
+
+# get cell type (cluster) to dissection (roi) mapping
+cluster_to_roi = cluster_region[, .N, by = c("Dataset", "cluster_id", "roi")] %>%
+  .[order(cluster_id, -N)] %>%
+  .[, Fraction := N/sum(N)*100, by = "cluster_id"]
+
+# check that clusters are distinct across neurons vs. non-neurons
+error_clusters = intersect(cluster_to_roi[Dataset == "Neuron", cluster_id], cluster_to_roi[Dataset == "Non-Neuron", cluster_id])
+# check length(error_clusters) == 0
+
+# Update lables
+cluster_to_roi[Dataset == "Neuron", Dataset := "Neurons"]
+cluster_to_roi[Dataset == "Non-Neuron", Dataset := "Non-neuronal cells"]
+
+# create histogram
+cluster_to_roi_hist = ggplot(cluster_to_roi[Fraction < 15], aes(x = Fraction, fill = Dataset)) +
+  geom_histogram(col="black", alpha = .5, binwidth = 1) +
+  scale_fill_manual(values = c("#20A39E", "#FF715B")) +
+  geom_vline(xintercept = 4.5, linetype = "dashed", color = "red") +
+  facet_wrap(Dataset ~ ., ncol = 1, scales = "free_y") +
+  labs(x = "Percent of cells per subtype in brain structure", y = "Count") +
+  scale_x_continuous(expand = expansion(c(0.01, 0.01)), n.breaks = 15) +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  theme_bw() +
+   theme(axis.title = element_text(face = "bold"),
+         strip.text = element_text(face = "bold"),
+         legend.position = "none")
+
+# write to file
+ggsave(here(neuroKG_dir, "2_enrich_kg", "cluster_to_ROI_histogram.pdf"), cluster_to_roi_hist, width = 4.5, height = 5.4)
+# ggsave(here(neuroKG_dir, "2_enrich_kg", "cluster_to_ROI_histogram.svg"), cluster_to_roi_hist, width = 8, height = 6)
+```
+
+# Construct Edges
+
+We construct the following edges:
+* Brain region (*i.e.*, `ROIGroupFine`) to brain structure (*i.e.*, `roi`).
+* Brain structure to cell cluster.
+* Cell type (*i.e.*, `supercluster`) to cell cluster.
+* Cell cluster to cell subcluster.
+* Cell type to marker gene (top 200).
+* Cell cluster to marker gene (top 50).
+* Cell subcluster to marker gene (top 10).
+
+## Brain Region Structural Edges
+
+First, construct brain region to brain structure (*i.e.*, `roi`) edges.
+
+```{r region-structure}
+# get new column name order
+new_colorder = colnames(neuroKG_edges) %>%
+  .[!(. %in% c("x_index", "y_index"))]
+
+# construct region to structure edges
+# note that x_index and y_index are added later
+region_to_structure_edges = copy(region_to_roi) %>%
+  merge(., roi_label_mapping, by = "roi", sort = F) %>%
+  setnames(c("ROIGroupFine", "roi", "label"), c("x_id", "y_id", "y_name")) %>%
+  .[, relation := "region_structure"] %>%
+  .[, display_relation := "parent-child"] %>%
+  .[, x_name := x_id] %>%
+  .[, x_type := "brain_region"] %>%
+  .[, x_source := "Siletti et al."] %>%
+  .[, y_type := "brain_structure"] %>%
+  .[, y_source := "Siletti et al."] %>%
+  setcolorder(new_colorder)
+
+# print number of new edges created
+message("Unique Brain Regions: ", length(unique(cluster_region$ROIGroupFine)))
+message("Unique Brain Structures: ", length(unique(cluster_region$roi)))
+message("Brain Region --> Structure Edges: ", nrow(region_to_structure_edges))
+```
+
+Next, using the histogram from the previous step to determine the selection threshold, construct brain structure (*i.e.*, `roi`) to cell cluster edges.
+
+```{r structure-cluster}
+# construct edges
+structure_to_cell_cluster_edges = cluster_to_roi[Fraction > 5, .(cluster_id, roi)] %>%
+  merge(., roi_label_mapping, by = "roi", sort = F) %>%
+  setnames(c("cluster_id", "roi", "label"), c("y_id", "x_id", "x_name")) %>%
+  .[, relation := "structure_cell_type"] %>%
+  .[, display_relation := "cell type present"] %>%
+  .[, x_type := "brain_structure"] %>%
+  .[, x_source := "Siletti et al."] %>%
+  .[, y_type := "cell_cluster"] %>%
+  .[, y_name := paste("cluster", y_id)] %>%
+  .[, y_source := "Siletti et al."] %>%
+  setcolorder(new_colorder)
+
+# print number of new edges created
+message("Unique Brain Structures: ", length(unique(cluster_region$roi)))
+message("Unique Cell Clusters: ", length(unique(cluster_region$cluster_id)))
+message("Structure --> Cluster Edges: ", nrow(structure_to_cell_cluster_edges))
+```
+
+## Cell Clustering Structural Edges
+
+Using the `cluster_region` table created previously, construct cell type (*i.e.*, `supercluster`) to cell cluster edges.
+
+```{r type-cluster}
+cell_type_to_cell_cluster_edges = cluster_region[, .(supercluster_term, cluster_id)] %>%
+  unique() %>%
+  setnames(c("supercluster_term", "cluster_id"), c("x_id", "y_id")) %>%
+  .[, relation := "cell_type_cell_cluster"] %>%
+  .[, display_relation := "parent-child"] %>%
+  .[, x_type := "cell_type"] %>%
+  .[, x_name := x_id] %>%
+  .[, x_source := "Siletti et al."] %>%
+  .[, y_type := "cell_cluster"] %>%
+  .[, y_name := paste("cluster", y_id)] %>%
+  .[, y_source := "Siletti et al."] %>%
+  setcolorder(new_colorder)
+
+# print number of new edges created
+message("Unique Clusters: ", length(unique(cluster_region$cluster_id)))
+message("Cell Type --> Cluster Edges: ", nrow(cell_type_to_cell_cluster_edges))
+```
+
+Using the `cluster_region` table created previously, construct cell cluster to cell subcluster edges.
+
+```{r cluster-subcluster}
+cell_cluster_to_cell_subcluster_edges = cluster_region[, .(cluster_id, subcluster_id)] %>%
+  unique() %>%
+  setnames(c("cluster_id", "subcluster_id"), c("x_id", "y_id")) %>%
+  .[, relation := "cell_cluster_cell_subcluster"] %>%
+  .[, display_relation := "parent-child"] %>%
+  .[, x_type := "cell_cluster"] %>%
+  .[, x_name := paste("cluster", x_id)] %>%
+  .[, x_source := "Siletti et al."] %>%
+  .[, y_type := "cell_subcluster"] %>%
+  .[, y_name := paste("subcluster", y_id)] %>%
+  .[, y_source := "Siletti et al."] %>%
+  setcolorder(new_colorder)
+
+# print number of new edges created
+message("Unique Subclusters: ", length(unique(cluster_region$subcluster_id)))
+message("Cell Cluster --> Subcluster Edges: ", nrow(cell_cluster_to_cell_subcluster_edges))
+```
+
+## Cell Clustering Marker Gene Edges
+
+We construct edges between genes and either cell type (*i.e.*, supercluster), cluster, or subcluster using the results of the marker gene analysis.
+
+First, construct cell type (*i.e.*, supercluster) to marker gene edges.
+
+```{r type-gene}
+# get top n genes from each cluster
+get_top_marker_genes = function(fread_result, n_genes = 200) {
+  fread_result %>%
+    .[1:n_genes, .SD, .SDcols = grep("_names", colnames(.), fixed = T, value = T)] %>%
+    melt(measure.vars = colnames(.), variable.name = "x_id", value.name = "y_name") %>%
+    return()
+}
+
+# dataset can be "neuron" or "non_neuron"
+get_cell_type_to_marker_gene_edges = function(dataset = "neuron") {
+
+  # file name to read supercluster markers
+  supercluster_marker_file = here(cell_type_dir, paste0(dataset, "_markers"), "supercluster_markers.csv")
+
+  # get top 200 genes
+  supercluster_markers = fread(supercluster_marker_file) %>%
+    get_top_marker_genes(n_genes = 400) %>%
+    .[, relation := "cell_type_marker_gene"] %>%
+    .[, display_relation := "expression present"] %>%
+    .[, x_id := gsub("_names", "", x_id, fixed = T)] %>%
+    .[, x_type := "cell_type"] %>%
+    .[, x_name := x_id] %>%
+    .[, x_source := "Siletti et al."] %>%
+    merge(neuroKG_nodes[node_type == "gene/protein"], by.x = "y_name", by.y = "node_name", all.x = F, all.y = F, sort = F) %>%
+    setnames(c("node_index", "node_id", "node_type", "node_source"), c("y_index", "y_id", "y_type", "y_source")) %>%
+    setcolorder(new_colorder)
+
+  # return supercluster markers
+  return(supercluster_markers)
+}
+
+# get neuron supercluster to gene edges
+neuron_cell_type_to_marker_gene_edges = get_cell_type_to_marker_gene_edges("neuron")
+non_neuron_cell_type_to_marker_gene_edges = get_cell_type_to_marker_gene_edges("non_neuron")
+cell_type_to_marker_gene_edges = rbind(neuron_cell_type_to_marker_gene_edges,  non_neuron_cell_type_to_marker_gene_edges)
+
+# print message
+message("Unique Cell Types: ", length(unique(cell_type_to_marker_gene_edges$x_id)))
+message("Cell Type --> Marker Gene Edges: ", nrow(cell_type_to_marker_gene_edges))
+```
+
+Construct cell cluster to marker gene edges. Select top 50 genes.
+
+```{r cluster-gene}
+# dataset can be "neuron" or "non_neuron"
+get_cell_cluster_to_marker_gene_edges = function(dataset = "neuron") {
+
+  # read cluster markers
+  if(dataset == "neuron") {
+    cluster_markers = imap(neuron_cluster_marker_files, ~fread(here(cell_type_dir, "neuron_markers", .x)))
+  } else {
+    cluster_markers = imap(non_neuron_cluster_marker_files, ~fread(here(cell_type_dir, "non_neuron_markers", .x)))
+  }
+
+  # get cluster markers using function defined above
+  # check with length(unique(non_neurons_cells$cluster_id))
+  cluster_markers = map_dfr(cluster_markers, ~get_top_marker_genes(.x, n_genes = 200))
+
+  # process edges
+  cluster_markers = copy(cluster_markers) %>%
+    .[, relation := "cell_cluster_marker_gene"] %>%
+    .[, display_relation := "expression present"] %>%
+    .[, x_id := gsub("_names", "", x_id, fixed = T)] %>%
+    .[, x_type := "cell_cluster"] %>%
+    .[, x_name := paste("cluster", x_id)] %>%
+    .[, x_source := "Siletti et al."] %>%
+    merge(neuroKG_nodes[node_type == "gene/protein"], by.x = "y_name", by.y = "node_name", all.x = F, all.y = F, sort = F) %>%
+    setnames(c("node_index", "node_id", "node_type", "node_source"), c("y_index", "y_id", "y_type", "y_source")) %>%
+    setcolorder(new_colorder)
+
+  # return cluster markers
+  return(cluster_markers)
+}
+
+# get neuron supercluster to gene edges
+neuron_cell_cluster_to_marker_gene_edges = get_cell_cluster_to_marker_gene_edges("neuron")
+non_neuron_cell_cluster_to_marker_gene_edges = get_cell_cluster_to_marker_gene_edges("non_neuron")
+cell_cluster_to_marker_gene_edges = rbind(neuron_cell_cluster_to_marker_gene_edges,  non_neuron_cell_cluster_to_marker_gene_edges)
+
+# print message
+message("Unique Cell Clusters: ", length(unique(cell_cluster_to_marker_gene_edges$x_id)))
+message("Cell Cluster --> Marker Gene Edges: ", nrow(cell_cluster_to_marker_gene_edges))
+```
+
+Construct cell subcluster to marker gene edges. Select top 50 genes.
+
+```{r subcluster-gene}
+# dataset can be "neuron" or "non_neuron"
+get_cell_subcluster_to_marker_gene_edges = function(dataset = "neuron") {
+
+  # read cluster markers
+  if(dataset == "neuron") {
+    subcluster_markers = imap(neuron_subcluster_marker_files, ~fread(here(cell_type_dir, "neuron_markers", .x)))
+  } else {
+    subcluster_markers = imap(non_neuron_subcluster_marker_files, ~fread(here(cell_type_dir, "non_neuron_markers", .x)))
+  }
+
+  # get cluster markers using function defined above
+  # check with length(unique(non_neurons_cells$cluster_id))
+  subcluster_markers = map_dfr(subcluster_markers, ~get_top_marker_genes(.x, n_genes = 50))
+
+  # process edges
+  subcluster_markers = copy(subcluster_markers) %>%
+    .[, relation := "cell_subcluster_marker_gene"] %>%
+    .[, display_relation := "expression present"] %>%
+    .[, x_id := gsub("_names", "", x_id, fixed = T)] %>%
+    .[, x_type := "cell_subcluster"] %>%
+    .[, x_name := paste("subcluster", x_id)] %>%
+    .[, x_source := "Siletti et al."] %>%
+    merge(neuroKG_nodes[node_type == "gene/protein"], by.x = "y_name", by.y = "node_name", all.x = F, all.y = F, sort = F) %>%
+    setnames(c("node_index", "node_id", "node_type", "node_source"), c("y_index", "y_id", "y_type", "y_source")) %>%
+    setcolorder(new_colorder)
+
+  # return cluster markers
+  return(subcluster_markers)
+}
+
+# get neuron supercluster to gene edges
+neuron_cell_subcluster_to_marker_gene_edges = get_cell_subcluster_to_marker_gene_edges("neuron")
+non_neuron_cell_subcluster_to_marker_gene_edges = get_cell_subcluster_to_marker_gene_edges("non_neuron")
+cell_subcluster_to_marker_gene_edges = rbind(neuron_cell_subcluster_to_marker_gene_edges,  non_neuron_cell_subcluster_to_marker_gene_edges)
+
+# print message
+message("Unique Cell Subclusters: ", length(unique(cell_subcluster_to_marker_gene_edges$x_id)))
+message("Cell Subcluster --> Marker Gene Edges: ", nrow(cell_subcluster_to_marker_gene_edges))
+```
+
+
+# Construct Nodes
+
+Construct nodes and populate `node_index` values; then, add node indices back to edges by merging as needed. There are 14 brain regions, 112 brain structures, 31 cell types, 450 cell clusters, and 3244 cell subclusters, so there should be $14 + 112 + 31 + 450 + 3244 = 3851$ new nodes.
+
+```{r construct-nodes}
+# get data.table of all new nodes created
+siletti_new_nodes = rbind(
+  # brain region to brain structure
+  region_to_structure_edges[, .(x_id, x_type, x_name, x_source)],
+  region_to_structure_edges[, .(y_id, y_type, y_name, y_source)],
+  # brain structure to cell cluster
+  structure_to_cell_cluster_edges[, .(x_id, x_type, x_name, x_source)],
+  structure_to_cell_cluster_edges[, .(y_id, y_type, y_name, y_source)],
+  # cell type to cell cluster
+  cell_type_to_cell_cluster_edges[, .(x_id, x_type, x_name, x_source)],
+  cell_type_to_cell_cluster_edges[, .(y_id, y_type, y_name, y_source)],
+  # cell cluster to cell subcluster
+  cell_cluster_to_cell_subcluster_edges[, .(x_id, x_type, x_name, x_source)],
+  cell_cluster_to_cell_subcluster_edges[, .(y_id, y_type, y_name, y_source)],
+  # cell type/cluster/subcluster to marker gene
+  cell_type_to_marker_gene_edges[, .(x_id, x_type, x_name, x_source)],
+  cell_cluster_to_marker_gene_edges[, .(x_id, x_type, x_name, x_source)],
+  cell_subcluster_to_marker_gene_edges[, .(x_id, x_type, x_name, x_source)],
+  use.names = FALSE
+) %>%
+  unique() %>%
+  setnames(c("x_id", "x_type", "x_name", "x_source"), c("node_id", "node_type", "node_name", "node_source"))
+
+# print new nodes created
+message("New Nodes Created: ", nrow(siletti_new_nodes))
+
+# get max index and number of nodes
+max_index = max(neuroKG_nodes$node_index) + 1
+n_nodes = nrow(siletti_new_nodes)
+
+# add node index according to NeuroKG syntax
+siletti_new_nodes = siletti_new_nodes %>%
+  .[, node_index := max_index:(max_index + n_nodes - 1)] %>%
+  setcolorder("node_index")
+
+# print head
+# head(siletti_new_nodes)
+```
+
+# Add Indices
+
+Add node indices to the edges to comply with the NeuroKG syntax.
+
+```{r add-indices}
+# function to add node indices given the x node type and y node type
+add_node_indices = function(edge_data_frame, x_node_type = NULL, y_node_type = NULL) {
+
+  if(is.null(x_node_type) & is.null(y_node_type)) stop("Indices may be added to only x nodes, only y nodes, or both, but not none.")
+
+  # make copy
+  idx_edge_data_frame = copy(edge_data_frame) %>%
+    .[, x_id := as.character(x_id)] %>%
+    .[, y_id := as.character(y_id)]
+
+  # if needed, add x_index
+  if(!is.null(x_node_type)) {
+    idx_edge_data_frame = idx_edge_data_frame %>%
+      merge(siletti_new_nodes[node_type == x_node_type, .(node_id, node_index)], by.x = "x_id", by.y = "node_id", all.x = T, all.y = F, sort = F) %>%
+      setnames("node_index", "x_index")
+  }
+
+  # if needed, add y_index
+  if(!is.null(y_node_type)) {
+    idx_edge_data_frame = idx_edge_data_frame %>%
+      merge(siletti_new_nodes[node_type == y_node_type, .(node_id, node_index)], by.x = "y_id", by.y = "node_id", all.x = T, all.y = F, sort = F) %>%
+      setnames("node_index", "y_index")
+  }
+
+  return(setcolorder(idx_edge_data_frame, colnames(neuroKG_edges)))
+
+}
+
+# brain region to brain structure
+idx_region_to_structure_edges = add_node_indices(region_to_structure_edges, "brain_region", "brain_structure")
+
+# brain structure to cell cluster
+idx_structure_to_cell_cluster_edges = add_node_indices(structure_to_cell_cluster_edges, "brain_structure", "cell_cluster")
+
+# cell type to cell cluster
+idx_cell_type_to_cell_cluster_edges = add_node_indices(cell_type_to_cell_cluster_edges, "cell_type", "cell_cluster")
+
+# cell cluster to cell subcluster
+idx_cell_cluster_to_cell_subcluster_edges = add_node_indices(cell_cluster_to_cell_subcluster_edges, "cell_cluster", "cell_subcluster")
+
+# cell type/cluster/subcluster to marker gene
+# note that y_index for gene/protein nodes has already been added
+idx_cell_type_to_marker_gene_edges = add_node_indices(cell_type_to_marker_gene_edges, "cell_type")
+idx_cell_cluster_to_marker_gene_edges = add_node_indices(cell_cluster_to_marker_gene_edges, "cell_cluster")
+idx_cell_subcluster_to_marker_gene_edges = add_node_indices(cell_subcluster_to_marker_gene_edges, "cell_subcluster")
+
+# bind all edges
+siletti_new_edges = rbind(
+  idx_region_to_structure_edges,
+  idx_structure_to_cell_cluster_edges,
+  idx_cell_type_to_cell_cluster_edges,
+  idx_cell_cluster_to_cell_subcluster_edges,
+  idx_cell_type_to_marker_gene_edges,
+  idx_cell_cluster_to_marker_gene_edges,
+  idx_cell_subcluster_to_marker_gene_edges
+)
+
+# print new nodes created
+message("New Edges Created: ", nrow(siletti_new_edges))
+
+# Write PINNACLE-relevant edges to CSV
+fwrite(idx_region_to_structure_edges, here(neuroKG_dir, "2_enrich_kg", "region_to_structure_edges.csv"))
+fwrite(idx_structure_to_cell_cluster_edges, here(neuroKG_dir, "2_enrich_kg", "structure_to_cell_cluster_edges.csv"))
+```
+
+
+# Add Edges from Kamath *et al.*
+
+```{r example-load-dataset}
+CombineMAST <- function(mast.results,component.pvalue.use, component.coef.use,correction,contrast.use){
+  mast.results <- lapply(mast.results,function(x){
+    if (contrast.use %in% x[['contrast']]){
+      x.out <- merge(x[contrast==contrast.use & component==component.pvalue.use,.(primerid, `Pr(>Chisq)`)],
+                     x[contrast==contrast.use & component==component.coef.use, .(primerid, coef, ci.hi, ci.lo,z)],
+                     by='primerid')
+      x.out[,fdr:=p.adjust(`Pr(>Chisq)`, correction)]
+      return(x.out)
+    }
+    else{
+      return(NULL)
+    }
+  })
+  return(mast.results)
+}
+```
+
+
+```{r kamath-marker-edges}
+library(qs)
+
+# Define directory
+kamath_dir = here("Data", "ASAP", "Kamath_Nature_Neuro")
+markers_dir = here(kamath_dir, "diffexp_markers")
+
+# List cell types
+markers_celltypes = list.files(here(markers_dir, "celltypes"))
+markers_subtypes = list.files(here(markers_dir, "subtypes"))
+
+# For each cell type
+celltype_markers = list()
+for (celltype in markers_celltypes) {
+  celltype_label = tolower(gsub("mastDE_(.*)\\.qs", "\\1", celltype))
+  celltype_markers[[celltype_label]] = qread(here(markers_dir, "celltypes", celltype))
+}
+celltype_markers = CombineMAST(celltype_markers,component.pvalue.use = 'H',component.coef.use = 'D', correction = 'fdr', contrast.use = 'clusteruse1')
+
+# For each subtype type
+subtype_markers = list()
+subtype_parents = list()
+for (subtype in markers_subtypes) {
+  celltype_label = tolower(gsub("mastDE_([^_]+)_(.*)\\.qs", "\\1", subtype))
+  subtype_label = gsub("mastDE_([^_]+)_(.*)\\.qs", "\\2", subtype)
+  subtype_markers[[subtype_label]] =  qread(here(markers_dir, "subtypes", subtype))
+  subtype_parents[[subtype_label]] = celltype_label
+
+}
+subtype_markers = CombineMAST(subtype_markers,component.pvalue.use = 'H',component.coef.use = 'D', correction = 'fdr', contrast.use = 'clusteruse1')
+subtype_parents = data.table(subtype = names(subtype_parents), celltype = unlist(subtype_parents))
+
+# Check that all subtype parents (extracted from file name) are valid cell types
+# Replace those that are not
+# Also check that all cell types have subtype children
+# names(celltype_markers) %in% subtype_parents$celltype
+# subtype_parents[!(celltype %in% names(celltype_markers))]
+subtype_parents = subtype_parents %>%
+  .[celltype %in% c("calb1", "sox6"), celltype := "da"] %>%
+  .[celltype == "macro", celltype := "mg"] %>%
+  .[celltype == "ependyma", celltype := "endo"]
+
+# Print dropped subtypes: noddt and ependyma
+dropped_subtypes = subtype_parents[!(celltype %in% names(celltype_markers)), ]
+message("Dropped subtypes: ", paste(dropped_subtypes[, subtype], collapse = ", "))
+message("Non-matching cell types: ", paste(dropped_subtypes[, celltype], collapse = ", "))
+subtype_parents = subtype_parents[celltype %in% names(celltype_markers)]
+# Check the following
+# all(subtype_parents$celltype %in% names(celltype_markers))
+
+# Drop subtypes not in subtype_parents$subtype
+subtype_markers = subtype_markers[names(subtype_markers) %in% subtype_parents$subtype]
+
+# Mapping from node ID to node name
+cell_type_name_mapping = list(
+  'astro' = 'astrocyte', 'da' = 'dopaminergic neuron', 'endo' = 'endothelial cell',
+  'ex' = 'excitatory neuron', 'inh' = 'inhibitory neuron', 'mg' = 'microglia',
+  'olig' = 'oligodendrocyte', 'opc' = 'oligodendrocyte precursor cell'
+)
+
+# Get max index and number of nodes
+max_index = max(siletti_new_nodes$node_index) + 1
+n_nodes = length(celltype_markers)+length(subtype_markers)
+
+# Create new nodes
+kamath_new_nodes = data.table(
+  node_index = max_index:(max_index + n_nodes - 1),
+  node_id = c(names(celltype_markers), names(subtype_markers)),
+  # node_name = c(names(celltype_markers), names(subtype_markers)),
+  node_name = c(unlist(cell_type_name_mapping[names(celltype_markers)]), names(subtype_markers)),
+  node_type = c(rep("cell_type", length(celltype_markers)), rep("cell_subtype", length(subtype_markers))),
+  node_source = "Kamath et al."
+)
+
+# Get gene nodes
+neuroKG_gene_nodes = neuroKG_nodes[node_type == 'gene/protein']
+
+# Create new edges
+kamath_celltype_gene_edges = list()
+for (celltype in names(celltype_markers)) {
+  celltype_edges = celltype_markers[[celltype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(-z)] %>% # order from greatest to least z-score
+    head(400) %>%
+    .[, x_id := celltype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_type_marker_gene"] %>%
+    .[, display_relation := "expression present"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_celltype_gene_edges = append(kamath_celltype_gene_edges, list(celltype_edges))
+}
+
+# Combine edges
+kamath_celltype_gene_edges = rbindlist(kamath_celltype_gene_edges)
+
+# Create subtype edges
+kamath_subtype_gene_edges = list()
+for (subtype in names(subtype_markers)) {
+  subtype_edges = subtype_markers[[subtype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(-z)] %>% # order from greatest to least z-score
+    head(200) %>%
+    .[, x_id := subtype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_subtype_marker_gene"] %>%
+    .[, display_relation := "expression present"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_subtype_gene_edges = append(kamath_subtype_gene_edges, list(subtype_edges))
+}
+
+# Combine edges
+kamath_subtype_gene_edges = rbindlist(kamath_subtype_gene_edges)
+
+# Create cell type to subtype edges
+kamath_cell_type_subtype_edges = copy(subtype_parents) %>%
+  .[, x_id := celltype] %>%
+  .[, y_id := subtype] %>%
+  .[, .(x_id, y_id)] %>%
+  merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+  set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+  merge(kamath_new_nodes, by.x = "y_id", by.y = "node_id", sort=F) %>%
+  set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+  .[, relation := "cell_type_cell_subtype"] %>%
+  .[, display_relation := "parent-child"] %>%
+  setcolorder(colnames(neuroKG_edges))
+
+# print number of new edges created
+message("Unique Kamath et al. Cell Types: ", length(unique(kamath_new_nodes[node_type == 'cell_type', node_id])))
+message("Cell Type --> Gene Edges: ", nrow(kamath_celltype_gene_edges))
+
+# print number of new edges created
+message("Unique Kamath et al. Cell Subtypes: ", length(unique(kamath_new_nodes[node_type == 'cell_subtype', node_id])))
+message("Cell Subtype --> Gene Edges: ", nrow(kamath_subtype_gene_edges))
+
+# print number of new edges created
+message("Kamath et al. Cell Type --> Cell Subtype Edges: ", nrow(kamath_cell_type_subtype_edges))
+```
+
+Repeat the analysis but for case-control edges.
+
+```{r kamath-case-control-edges}
+# Define directories
+casecontrol_dir = here(kamath_dir, "diffexp_casecontrol")
+casecontrol_celltypes = list.files(here(casecontrol_dir, "celltypes"))
+celltype_nodes = kamath_new_nodes[node_type == "cell_type"][["node_id"]]
+
+# casecontrol_subtypes = list.files(here(casecontrol_dir, "subtypes"), recursive = TRUE)
+casecontrol_subtypes = list()
+for (celltype in celltype_nodes) {
+  subtype_files = list.files(here(casecontrol_dir, "subtypes", celltype))
+  if (celltype == "da") {
+    subtype_files = subtype_files[grepl("nonurr", subtype_files)]
+  }
+  subtype_files = paste(celltype, subtype_files, sep = "/")
+  casecontrol_subtypes[[celltype]] = subtype_files
+}
+casecontrol_subtypes = unlist(casecontrol_subtypes)
+# sum(unlist(lapply(casecontrol_subtypes, length)))
+
+# For each cell type
+celltype_casecontrol = list()
+for (celltype in casecontrol_celltypes) {
+  celltype_label = tolower(gsub("mastDE_(.*)\\.qs", "\\1", celltype))
+  celltype_casecontrol[[celltype_label]] = qread(here(casecontrol_dir, "celltypes", celltype))
+}
+
+# Subset to Nurr(+) (nurr, for DA, EX, INH) or Nurr(-) (nonurr, for all others)
+selected_celltype_casecontrol <- list(
+  astro = celltype_casecontrol[["astro"]],      # glial cell: use full
+  mg    = celltype_casecontrol[["mg"]],         # microglia: use full
+  endo  = celltype_casecontrol[["endo"]],       # endothelial: use full
+  olig  = celltype_casecontrol[["olig"]],       # oligodendrocyte: use full
+  opc   = celltype_casecontrol[["opc"]],        # OPC: use full
+  ex    = celltype_casecontrol[["ex_nonurr"]],  # excitatory neuron: use nonurr
+  inh   = celltype_casecontrol[["inh_nonurr"]], # inhibitory neuron: use nonurr
+  da    = celltype_casecontrol[["da_nonurr"]]   # dopaminergic neuron: use full
+)
+
+celltype_casecontrol = CombineMAST(selected_celltype_casecontrol,component.pvalue.use = 'H',component.coef.use = 'D', correction = 'fdr', contrast.use = 'statusDisease')
+
+# For each subtype type
+subtype_nodes = kamath_new_nodes[node_type == "cell_subtype"][["node_id"]]
+da_subtypes = subtype_parents[celltype == "da", subtype]
+subtype_casecontrol = list()
+subtype_casecontrol_files = list()
+for (subtype_label in subtype_nodes) {
+
+  subtype_file_ext = ifelse(subtype_label %in% da_subtypes, "_nonurr.qs", ".qs")
+  subtype_file_ending = paste0(subtype_label, subtype_file_ext)
+
+  subtype_file_bool = grepl(subtype_file_ending, casecontrol_subtypes)
+  if (sum(subtype_file_bool) != 1) {
+    warning("Subtype not found: ", subtype_label)
+    subtype_casecontrol_files[[subtype_label]] = NA
+  } else{
+    subtype_file = casecontrol_subtypes[subtype_file_bool]
+    subtype_casecontrol[[subtype_label]] =  qread(here(casecontrol_dir, "subtypes", subtype_file))
+    subtype_casecontrol_files[[subtype_label]] = subtype_file
+  }
+}
+subtype_casecontrol_files = data.table(subtype = names(subtype_casecontrol_files), file = subtype_casecontrol_files)
+
+subtype_casecontrol = CombineMAST(subtype_casecontrol,component.pvalue.use = 'H',component.coef.use = 'D', correction = 'fdr', contrast.use = 'statusDisease')
+
+########################################
+# CELL TYPE UPREGULATED IN PD
+########################################
+
+# Create new edges
+kamath_celltype_gene_upregulated_edges = list()
+for (celltype in names(celltype_casecontrol)) {
+  celltype_upregulated_edges = celltype_casecontrol[[celltype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(-z)] %>% # order from greatest to least z-score
+    head(400) %>%
+    .[, x_id := celltype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_type_upregulated_PD"] %>%
+    .[, display_relation := "upregulated in PD"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_celltype_gene_upregulated_edges = append(kamath_celltype_gene_upregulated_edges, list(celltype_upregulated_edges))
+}
+
+# Combine edges
+kamath_celltype_gene_upregulated_edges = rbindlist(kamath_celltype_gene_upregulated_edges)
+
+########################################
+# CELL TYPE DOWNREGULATED IN PD
+########################################
+
+# Create new edges
+kamath_celltype_gene_downregulated_edges = list()
+for (celltype in names(celltype_casecontrol)) {
+  celltype_downregulated_edges = celltype_casecontrol[[celltype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(z)] %>% # order from least to greatest z-score
+    head(400) %>%
+    .[, x_id := celltype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_type_downregulated_PD"] %>%
+    .[, display_relation := "downregulated in PD"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_celltype_gene_downregulated_edges = append(kamath_celltype_gene_downregulated_edges, list(celltype_downregulated_edges))
+}
+
+# Combine edges
+kamath_celltype_gene_downregulated_edges = rbindlist(kamath_celltype_gene_downregulated_edges)
+
+########################################
+# CELL SUBTYPE UPREGULATED IN PD
+########################################
+
+# Create subtype edges
+kamath_subtype_gene_upregulated_edges = list()
+for (subtype in names(subtype_casecontrol)) {
+  subtype_upregulated_edges = subtype_casecontrol[[subtype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(-z)] %>% # order from greatest to least z-score
+    head(200) %>%
+    .[, x_id := subtype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_subtype_upregulated_PD"] %>%
+    .[, display_relation := "upregulated in PD"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_subtype_gene_upregulated_edges = append(kamath_subtype_gene_upregulated_edges, list(subtype_upregulated_edges))
+}
+
+# Combine edges
+kamath_subtype_gene_upregulated_edges = rbindlist(kamath_subtype_gene_upregulated_edges)
+
+########################################
+# CELL SUBTYPE DOWNREGULATED IN PD
+########################################
+
+# Create subtype edges
+kamath_subtype_gene_downregulated_edges = list()
+for (subtype in names(subtype_casecontrol)) {
+  subtype_downregulated_edges = subtype_casecontrol[[subtype]] %>%
+    .[primerid %in% neuroKG_gene_nodes$node_name] %>%
+    .[order(z)] %>% # order from least to greatest z-score
+    head(200) %>%
+    .[, x_id := subtype] %>%
+    .[, y_name := primerid] %>%
+    .[, .(x_id, y_name)] %>%
+    .[, relation := "cell_subtype_downregulated_PD"] %>%
+    .[, display_relation := "downregulated in PD"] %>%
+    merge(kamath_new_nodes, by.x = "x_id", by.y = "node_id", sort=F) %>%
+    set_colnames({gsub("node", "x", names(.), fixed=T)}) %>%
+    merge(neuroKG_gene_nodes, by.x = "y_name", by.y = "node_name", sort=F) %>%
+    set_colnames({gsub("node", "y", names(.), fixed=T)}) %>%
+    setcolorder(colnames(neuroKG_edges))
+  kamath_subtype_gene_downregulated_edges = append(kamath_subtype_gene_downregulated_edges, list(subtype_downregulated_edges))
+}
+
+# Combine edges
+kamath_subtype_gene_downregulated_edges = rbindlist(kamath_subtype_gene_downregulated_edges)
+
+# print number of new edges created
+message("Cell Type --> Gene Upregulated in PD Edges: ", nrow(kamath_celltype_gene_upregulated_edges))
+message("Cell Subtype --> Gene Upregulated in PD Edges: ", nrow(kamath_subtype_gene_upregulated_edges))
+
+message("Cell Type --> Gene Downregulated in PD Edges: ", nrow(kamath_celltype_gene_downregulated_edges))
+message("Cell Subtype --> Gene Downregulated in PD Edges: ", nrow(kamath_subtype_gene_downregulated_edges))
+
+# Add to all new edges
+message("New Edges from Siletti et al.: ", nrow(siletti_new_edges))
+all_new_edges = rbind(
+  siletti_new_edges,
+  kamath_celltype_gene_edges,
+  kamath_subtype_gene_edges,
+  kamath_cell_type_subtype_edges,
+  kamath_celltype_gene_upregulated_edges,
+  kamath_celltype_gene_downregulated_edges,
+  kamath_subtype_gene_upregulated_edges,
+  kamath_subtype_gene_downregulated_edges
+)
+message("Final New Edges: ", nrow(all_new_edges))
+message("New Edges from Kamath et al.: ", nrow(all_new_edges) - nrow(siletti_new_edges))
+
+# Add to new nodes
+all_new_nodes = rbind(siletti_new_nodes, kamath_new_nodes)
+```
+
+
+
+
+
+# Construct Reverse Edges
+
+Since graph is undirected, construct and merge reverse edges.
+
+```{r construct-reverse}
+# copy edges, where ^ indictes start of character
+reverse_edges = copy(all_new_edges)
+names(reverse_edges) = gsub("^x_", "temp_", names(reverse_edges))
+names(reverse_edges) = gsub("^y_", "x_", names(reverse_edges))
+names(reverse_edges) = gsub("^temp_", "y_", names(reverse_edges))
+setcolorder(reverse_edges, colnames(all_new_edges))
+
+# merge edges with original
+all_new_edges_undirected = rbind(all_new_edges, reverse_edges, use.names = T)
+```
+
+# Add to NeuroKG
+
+Add the newly-constructed nodes and edges to NeuroKG.
+
+```{r save-neurokg}
+# add nodes to neuroKG
+neuroKG_nodes = rbind(neuroKG_nodes, all_new_nodes)
+
+# add edges to neuroKG
+neuroKG_edges = rbind(neuroKG_edges, all_new_edges_undirected)
+
+# print number of nodes and edges
+message("NeuroKG Nodes:\t", nrow(neuroKG_nodes))
+message("NeuroKG Edges:\t", nrow(neuroKG_edges)/2)
+
+# save to file
+saveRDS(neuroKG_nodes, here(neuroKG_dir, "2_enrich_kg", "neuroKG_nodes.RDS"))
+saveRDS(neuroKG_edges, here(neuroKG_dir, "2_enrich_kg", "neuroKG_edges.RDS"))
+
+# write to CSV
+fwrite(neuroKG_nodes, here(neuroKG_dir, "2_enrich_kg", "neuroKG_nodes.csv"))
+fwrite(neuroKG_edges, here(neuroKG_dir, "2_enrich_kg", "neuroKG_edges.csv"))
+```
+
+# Create Cell Signature Figure
+
+Create enrichment plots that show that cell-type marker genes are enriched in the list of all genes.
+
+```{r signature-enrichment}
+# read supercluster markers
+non_neuron_supercluster_markers = here(cell_type_dir, "non_neuron_markers", "supercluster_markers.csv") %>%
+  fread()
+
+# get astrocyte markers
+astrocyte_markers = non_neuron_supercluster_markers %>%
+  .[, .SD, .SDcols = grep("Astrocyte", colnames(.), value = T)] %>%
+  .[, Ranking := 1:nrow(.)]
+
+# read astrocyte gene sets
+astrocyte_gene_sets = here("data", "scrnaseq", "gene_sets", "astrocyte_gene_sets.csv") %>%
+  fread()
+
+# get ADRA gene set and scores
+ADRA_genes = astrocyte_gene_sets$`Serrano-Pozo_ADRA` %>% .[!(. == "")]
+ADRA_gene_scores = astrocyte_markers[Astrocyte_names %in% ADRA_genes]
+
+# create barcode plot
+pdf(here(neuroKG_dir, "2_enrich_kg", "astrocyte_enrichment_plot.pdf"), width = 6, height = 5)
+limma::barcodeplot(astrocyte_markers$Astrocyte_scores, ADRA_gene_scores$Ranking)
+dev.off()
+
+# BiocManager::install("fgsea")
+library(fgsea)
+
+# Run GSEA
+ranks = astrocyte_markers$Astrocyte_scores
+names(ranks) = astrocyte_markers$Astrocyte_names
+ranks = sort(ranks, decreasing = TRUE)
+
+# Define ADRA gene set
+ADRA_gene_set = list(ADRA = ADRA_genes)
+
+# Run GSEA
+gsea_results = fgsea(pathways = ADRA_gene_set, stats = ranks)
+leading_edge = astrocyte_markers[Astrocyte_names %in% gsea_results$leadingEdge[[1]]]
+
+# Print results
+print(gsea_results)
+
+pd = plotEnrichmentData(pathway = ADRA_gene_set$ADRA, ranks)
+p = ggplot(data = pd$curve) +
+  geom_line(aes(x = rank, y = ES), color = "#2660A4", linewidth = 1) +
+  geom_segment(data = pd$ticks, mapping = aes(x = rank, y = -pd$spreadES/16, xend = rank, yend =
+                                             pd$spreadES/16), linewidth = 0.2) +
+  geom_hline(yintercept = pd$posES,
+             colour = "red", linetype = "dashed") +
+  geom_hline(yintercept = pd$negES, colour = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, colour = "black") +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_line(color = "grey92")) +
+  labs(x = "Rank", y = "Enrichment score") +
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(here(neuroKG_dir, "2_enrich_kg", "astrocyte_gsea_plot.pdf"), width = 6, height = 5)
+```

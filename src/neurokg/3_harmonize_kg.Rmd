@@ -1,0 +1,227 @@
+---
+title: Harmonize Knowledge Graph
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(data.table)
+library(purrr)
+library(magrittr)
+library(here)
+library(igraph)
+library(ggplot2)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+neuroKG_dir = here("data", "neurokg", "2_enrich_kg")
+save_dir = here("data", "neurokg", "3_harmonize_kg")
+final_dir = here("data", "neurokg")
+```
+
+# Read Data
+
+```{r read-neurokg}
+neuroKG_nodes = readRDS(here(neuroKG_dir, "neuroKG_nodes.RDS"))
+neuroKG_edges = readRDS(here(neuroKG_dir, "neuroKG_edges.RDS"))
+
+message("Initial nodes in NeuroKG: ", nrow(neuroKG_nodes))
+message("Initial edges in NeuroKG: ", nrow(neuroKG_edges) / 2)
+```
+
+Check for any duplicated IDs.
+
+```{r check-ids}
+# check that index --> ID mapping is unique
+dups = neuroKG_nodes[, .(node_index, node_id, node_type)] %>%
+  .[, joint_id := paste(node_id, node_type, sep = "_")] %>%
+  unique() %>%
+  .[joint_id %in% .[duplicated(joint_id), joint_id]] %>%
+  .[order(joint_id)]
+
+if(nrow(dups) > 0) {
+  cat("Converting ", append = T)
+  for (dup_index in dups[duplicated(joint_id), node_index]) {
+
+    # get joint id
+    dup_joint_id = dups[node_index == dup_index, joint_id]
+    index_to_keep = dups[joint_id == dup_joint_id, ][1, node_index]
+
+    # convert ID
+    neuroKG_edges[x_index == dup_index, x_index := index_to_keep]
+    neuroKG_edges[y_index == dup_index, y_index := index_to_keep]
+
+    # get ID to convert to
+    cat(dup_index, " -> ", index_to_keep, ", ", append = T, sep = "")
+
+  }
+  cat("\n")
+}
+
+message("Number of duplicate IDs: ", nrow(dups) / 2)
+```
+
+Check number of nodes that have at least one edge.
+
+```{r check-edges}
+node_IDs_from_edges = c(neuroKG_edges$x_index, neuroKG_edges$y_index)
+unique_node_IDs = unique(node_IDs_from_edges)
+message("Number of non-isolated nodes: ", length(unique_node_IDs))
+```
+
+Take largest connected component (LCC, weakly connected) of graph.
+
+```{r take-lcc}
+# convert to igraph object
+neuroKG_graph = graph_from_data_frame(neuroKG_edges[, .(x_index, y_index)], directed = TRUE)
+
+# extract LCC
+neuroKG_components = components(neuroKG_graph, mode = "weak")
+neuroKG_lcc_nodes = V(neuroKG_graph)[which(neuroKG_components$membership == which.max(neuroKG_components$csize))]
+neuroKG_lcc = induced_subgraph(neuroKG_graph, neuroKG_lcc_nodes)
+
+# convert back to data frame
+neuroKG_lcc_nodes = as_data_frame(neuroKG_lcc, what = c("vertices"))
+neuroKG_lcc_edges = as_data_frame(neuroKG_lcc, what = c("edges"))
+
+# filter nodes and edges for LCC
+neuroKG_nodes = neuroKG_nodes[node_index %in% neuroKG_lcc_nodes$name]
+neuroKG_edges = neuroKG_edges[(x_index %in% neuroKG_lcc_nodes$name) & (y_index %in% neuroKG_lcc_nodes$name)]
+
+message("Nodes in LCC: ", nrow(neuroKG_lcc_nodes))
+message("Edges in LCC: ", nrow(neuroKG_lcc_edges) / 2)
+message("Nodes in filtered NeuroKG: ", nrow(neuroKG_nodes))
+message("Edges in filtered NeuroKG: ", nrow(neuroKG_edges) / 2)
+```
+
+Create ID look-up table to map old IDs to new, continuous IDs after table modification.
+
+```{r lookup}
+neuroKG_nodes = neuroKG_nodes[order(node_index), ]
+neuroKG_edges = neuroKG_edges[order(x_index, y_index), ]
+
+lookup = data.table(old_index = neuroKG_nodes$node_index, new_index = 1:nrow(neuroKG_nodes) - 1)
+saveRDS(lookup, here(save_dir, "primeKG_to_neuroKG_node_index.RDS"))
+
+neuroKG_nodes$node_index = lookup$new_index[match(neuroKG_nodes$node_index, lookup$old_index)]
+neuroKG_edges$x_index = lookup$new_index[match(neuroKG_edges$x_index, lookup$old_index)]
+neuroKG_edges$y_index = lookup$new_index[match(neuroKG_edges$y_index, lookup$old_index)]
+
+# reorder again (unnecessary)
+neuroKG_nodes = neuroKG_nodes[order(node_index), ]
+
+message("Maximum node index: ", max(neuroKG_nodes$node_index))
+message("Maximum node index from edges: ", max(neuroKG_edges$x_index))
+```
+
+# Process NeuroKG
+
+Define function to construct unique edge type label.
+
+```{r edge-label}
+construct_label = function(x_index, relation_label, y_index) {
+  if (x_index < y_index) {
+    return(paste(x_index, relation_label, y_index, sep = "_"))
+  } else {
+    return(paste(y_index, relation_label, x_index, sep = "_"))
+  }
+}
+```
+
+Make sure that forward and reverse edges are alphabetically ordered by first removing all reverse edges, ordering forward edges, and then re-constructing reverse edges. Forward edges always require that first element in triplet is alphabetically first (*i.e.*, node types of triplets are alphabetically ordered). If `anatomy - gene/protein` and `gene/protein - anatomy` are both forward edges, but also `gene/protein-reverse-anatomy` and `anatomy-reverse-gene/protein` are reverse edges, then we have artificially increased the number of edge types (*i.e.*, more weight matrices in bilinear decoder and HGT) which makes model training more difficult.
+
+Then, add direction label, edge index, full relation column, etc.
+
+```{r process-edges}
+forward_edges = neuroKG_edges[x_index < y_index]
+
+# Split edges into correctly and incorrectly ordered
+correct_alph_order = forward_edges[x_type <= y_type]
+incorrect_alph_order = forward_edges[x_type > y_type]
+
+# Reorder incorrectly ordered edges if needed by swapping column names
+setnames(incorrect_alph_order, old = c("relation", "display_relation", "x_index", "x_id", "x_type", "x_name", "x_source", "y_index", "y_id", "y_type", "y_name", "y_source"), new = c("relation", "display_relation", "y_index", "y_id", "y_type", "y_name", "y_source", "x_index", "x_id", "x_type", "x_name", "x_source"))
+setcolorder(incorrect_alph_order, colnames(correct_alph_order))
+
+# Merge back with forward edges
+ordered_forward_edges = rbind(correct_alph_order, incorrect_alph_order)
+
+# Construct ordered reverse edges
+ordered_reverse_edges = copy(ordered_forward_edges)
+setnames(ordered_reverse_edges, old = c("relation", "display_relation", "x_index", "x_id", "x_type", "x_name", "x_source", "y_index", "y_id", "y_type", "y_name", "y_source"), new = c("relation", "display_relation", "y_index", "y_id", "y_type", "y_name", "y_source", "x_index", "x_id", "x_type", "x_name", "x_source"))
+setcolorder(ordered_reverse_edges, colnames(ordered_forward_edges))
+
+# Add direction label
+ordered_reverse_edges = ordered_reverse_edges %>%
+  .[, direction := "reverse"]
+ordered_forward_edges = ordered_forward_edges[, direction := "forward"]
+
+# Combine edges back together
+kg_edges_final = rbind(ordered_forward_edges, ordered_reverse_edges)
+
+kg_edges_final = kg_edges_final[order(pmin(x_index, y_index), pmax(x_index, y_index), display_relation), ]
+
+# Add index label to `kg_edges` with relation included
+kg_edges_final = kg_edges_final %>%
+  .[, relation_label := as.integer(factor(relation))] %>%
+  .[, index_label := pmap(list(x_index, relation_label, y_index), construct_label)]
+
+# Add reverse type label (note, after adding index label)
+kg_edges_final = kg_edges_final %>%
+  .[, relation_label := NULL] %>%
+  .[direction == "reverse", relation := paste("rev", relation, sep = "_")]
+
+# Add full relation column to edge matrix
+kg_edges_final = kg_edges_final %>%
+  .[, edge_index := (1:nrow(kg_edges_final)) - 1] %>% # zero-indexed
+  .[, full_relation := paste(x_type, relation, y_type, sep = ";")]
+
+# Reorder columns
+setcolorder(kg_edges_final, c("edge_index", "index_label", "direction", "relation", "display_relation", "full_relation"))
+
+message("Total edges: ", nrow(kg_edges_final))
+message("Forward edges: ", nrow(kg_edges_final[direction == "forward"]))
+message("Reverse edges: ", nrow(kg_edges_final[direction == "reverse"]))
+
+# Check for mismatched edges:
+#   - All edges with even indices should be forward.
+#   - All edges with odd indices should be odd.
+#   - Each forward edge should immediately be followed by its reverse edge.
+even_edges = kg_edges_final[, ifelse(edge_index %% 2 == 0, "forward", "reverse")]
+even_mismatch = kg_edges_final[direction != even_edges]
+message("Forward/reverse mismatch: ", nrow(even_mismatch))
+
+```
+
+
+# Save Data
+
+```{r save-neurokg}
+neuroKG_edges = kg_edges_final
+
+saveRDS(neuroKG_nodes, here(save_dir, "neuroKG_nodes.RDS"))
+saveRDS(neuroKG_edges, here(save_dir, "neuroKG_edges.RDS"))
+
+fwrite(neuroKG_nodes, here(save_dir, "neuroKG_nodes.csv"))
+fwrite(neuroKG_edges, here(save_dir, "neuroKG_edges.csv"))
+
+# Copy to final directory
+# Or download from Harvard Dataverse
+# fwrite(neuroKG_nodes, here(final_dir, "nodes.csv"))
+# fwrite(neuroKG_edges, here(final_dir, "edges.csv"))
+```

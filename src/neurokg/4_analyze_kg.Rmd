@@ -1,0 +1,453 @@
+---
+title: Harmonize Knowledge Graph
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(data.table)
+library(purrr)
+library(magrittr)
+library(here)
+library(stringr)
+library(ggplot2)
+library(pheatmap)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+neuroKG_dir = here("data", "neurokg", "3_harmonize_kg")
+save_dir = here("data", "neurokg", "4_analyze_kg")
+```
+
+# Read Data
+
+```{r read-neurokg}
+neuroKG_nodes = readRDS(here(neuroKG_dir, "neuroKG_nodes.RDS"))
+neuroKG_edges = readRDS(here(neuroKG_dir, "neuroKG_edges.RDS"))
+
+message("Nodes in NeuroKG: ", nrow(neuroKG_nodes))
+message("Edges in NeuroKG: ", nrow(neuroKG_edges) / 2)
+
+# Create tables
+degree_table = neuroKG_edges %>%
+  .[, .N, by = 'x_index'] %>%
+  merge(neuroKG_nodes, by.x = "x_index", by.y = "node_index", all.x = TRUE)
+
+node_table =  degree_table[, .(avg_degree = mean(N), sd_degree = sd(N),  num_nodes = .N), by = node_type] %>%
+  .[order(-num_nodes)] %>%
+  .[, avg_degree := round(avg_degree, 2)] %>%
+  .[, sd_degree := round(sd_degree, 2)] %>%
+  setcolorder(c('node_type', 'num_nodes'))
+
+edge_table = neuroKG_edges %>%
+  .[direction == 'forward'] %>%
+  .[, .(num_edges = .N), by = c("x_type", "relation", "y_type")] %>%
+  .[order(-num_edges)] %>%
+  .[, x_type := gsub("_", " ", x_type, fixed = T)] %>%
+  .[, y_type := gsub("_", " ", y_type, fixed = T)] %>%
+  .[, relation_label := paste(x_type, y_type, sep = " - ")]
+```
+
+# Plot Edge Type Distribution
+
+```{r plot-edges}
+# Generate final edge type matrix, do not include `display_relation`
+edge_type_count = neuroKG_edges[, .N, by = c("x_type", "relation", "y_type", "direction")][order(x_type, y_type, relation)]
+fwrite(edge_type_count, here(save_dir, "edge_type_count.csv"))
+
+node_type_colors = c("#EA7286", "#EAB281", "#E3E19F", "#A9C484", "#5D937B", "#58525A", "#A07CA7", "#F4A4BF", "#F5D1B6", "#EEEDE3", "#D6CEC2", "#A2A6A9", "#777F8F", "#A3B2D2", "#BFDED8", "#BF796D")
+
+edge_type_count_plot = edge_type_count %>%
+  .[direction == "forward"] %>%
+  .[, x_type := gsub("_", " ", x_type, fixed = T)] %>%
+  .[, y_type := gsub("_", " ", y_type, fixed = T)] %>%
+  .[, relation_label := paste(x_type, y_type, sep = " - ")] %>%
+  .[relation == "anatomy_protein_absent", relation_label := "anatomy - gene/protein absent"] %>%
+  .[relation == "anatomy_protein_present", relation_label := "anatomy - gene/protein present"] %>%
+  .[relation == "contraindication", relation_label := "disease - drug contraindication"] %>%
+  .[relation == "indication", relation_label := "disease - drug indication"] %>%
+  .[relation == "off_label_use", relation_label := "disease - drug off-label use"] %>%
+  .[relation == "strong_clinical_evidence", relation_label := "disease - drug strong clinical evidence"] %>%
+  .[relation == "weak_clinical_evidence", relation_label := "disease - drug weak clinical evidence"] %>%
+  .[relation == "disease_phenotype_negative", relation_label := "disease - effect/phenotype negative"] %>%
+  .[relation == "disease_phenotype_positive", relation_label := "disease - effect/phenotype positive"] %>%
+  .[relation == "disease_protein_negative", relation_label := "disease - protein negative"] %>%
+  .[relation == "disease_protein_positive", relation_label := "disease - protein positive"] %>%
+  # New single-cell edges
+  .[relation == "cell_type_marker_gene", relation_label := "cell type - marker gene"] %>%
+  .[relation == "cell_type_upregulated_PD", relation_label := "cell type - PD upreg. gene"] %>%
+  .[relation == "cell_type_downregulated_PD", relation_label := "cell type - PD downreg. gene"] %>%
+  .[relation == "cell_subtype_marker_gene", relation_label := "cell subtype - marker gene"] %>%
+  .[relation == "cell_subtype_upregulated_PD", relation_label := "cell subtype - PD upreg. gene"] %>%
+  .[relation == "cell_subtype_downregulated_PD", relation_label := "cell subtype - PD downreg. gene"] %>%
+  .[order(N)] %>%
+  .[, relation_label := factor(relation_label, levels = relation_label)]
+
+# Plot edge type count
+p = ggplot(edge_type_count_plot, aes(x = N, y = relation_label, fill = x_type)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = node_type_colors) +
+  # scale_fill_viridis_c() +
+  # scale_x_continuous(labels = scales::scientific_format()) +
+  # scale_x_continuous(expand = expansion(c(0, 0.05))) +
+  scale_x_log10(expand = expansion(c(0, 0.05)), labels = scales::label_log(base=10), n.breaks = 7) +  # Apply log scale to x-axis
+  labs(x = "Count",y = "Relation", fill = "Source Node") +
+  theme_bw() +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        axis.title = element_text(face = "bold"),
+        # legend.position = "bottom",
+        legend.title = element_text(face = "bold"),
+        plot.margin = margin(5, 15, 5, 5, "pt"))  # Adjust y-axis text angle
+
+ggsave(here(save_dir, "edge_type_count.pdf"), p, width = 10, height = 8)
+```
+
+# Plot Degree
+
+Count node and edge types.
+
+```{r count-types}
+node_types = neuroKG_nodes[, .N, by = c("node_type")] %>%
+  .[order(-N)]
+
+edge_types = neuroKG_edges[, .N, by = c("x_type", "relation", "display_relation", "y_type", "direction")] %>%
+  .[order(-N)]
+```
+
+Calculate degree of each node.
+
+```{r calculate-degree}
+degree_x = neuroKG_edges[, .N, by = "x_index"]
+kg_degree = merge(neuroKG_nodes, degree_x, by.x = "node_index", by.y = "x_index", sort = F) %>%
+  setnames("N", "degree")
+
+# Remap node type values
+kg_degree = kg_degree %>%
+  .[, node_type := gsub("_", " ", node_type, fixed = T)]
+
+log_breaks = 10^seq(0, 4, by = 0.2)
+
+# Calculate the value ranges for each bar
+set.seed(42)
+bin_ranges = ggplot_build(
+  ggplot(kg_degree, aes(x = degree)) +
+    geom_histogram(breaks = log_breaks) +
+    scale_x_log10() +
+    theme()
+)$data[[1]] %>%
+  as.data.table() %>%
+  .[, label_x := (xmin + xmax)/2] %>%
+  .[, label_y := ymax + sample(1000:10000, length(ymax))] %>%
+  .[, label := paste0("[", floor(10^xmin), ", ", floor(10^xmax), ")")]
+  # .[, label := floor(10^xmax)]
+
+degree_plot = ggplot(kg_degree, aes(x = degree)) +
+  geom_histogram(aes(fill = node_type), breaks = log_breaks, color = "black") + #  alpha = 0.7
+  scale_fill_manual(values = node_type_colors) +
+  geom_text(data = bin_ranges, aes(x = 10^label_x, y = label_y, label = label),
+            vjust = -0.5, size = 2) +
+  geom_segment(data = bin_ranges,
+               aes(x = 10^label_x, y = ymax, xend = 10^label_x, yend = label_y),
+               color = "black") +
+  labs(x = "Degree", y = "Count", fill = "Node Type") +
+  theme_bw() +
+  scale_x_log10() +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  theme(axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+ggsave(here(save_dir, "degree_distribution.pdf"), degree_plot, width = 8, height = 6)
+```
+
+# Compare to PrimeKG
+
+```{r compare-primekg}
+primeKG_nodes = fread(here("Data", "PrimeKG", "original", "nodes.tab")) %>%
+  suppressWarnings()
+
+# Get genes
+neuroKG_genes = neuroKG_nodes[node_type == "gene/protein"]
+primeKG_genes = primeKG_nodes[node_type == "gene/protein"]
+
+# Count genes in NeuroKG but not in PrimeKG
+neuroKG_not_primeKG = neuroKG_genes[!node_name %in% primeKG_genes$node_name]
+
+# Count genes in PrimeKG but not in NeuroKG
+primeKG_not_neuroKG = primeKG_genes[!node_name %in% neuroKG_genes$node_name]
+
+# Print results
+message("Genes in NeuroKG but not in PrimeKG: ", nrow(neuroKG_not_primeKG))
+message("Genes in PrimeKG but not in NeuroKG: ", nrow(primeKG_not_neuroKG))
+
+# Count microRNAs based on regex on node name for MIR
+neuroKG_miRNAs = neuroKG_genes[grepl("^MIR", node_name)]
+primeKG_miRNAs = primeKG_genes[grepl("^MIR", node_name)]
+message(nrow(neuroKG_miRNAs), " miRNAs in NeuroKG vs. ", nrow(primeKG_miRNAs), " in PrimeKG")
+
+# Count long intergenic non-coding RNAs based on regex on node name for LINC
+neuroKG_lincs = neuroKG_genes[grepl("^LINC", node_name)]
+primeKG_lincs = primeKG_genes[grepl("^LINC", node_name)]
+message(nrow(neuroKG_lincs), " LINCs in NeuroKG vs. ", nrow(primeKG_lincs), " in PrimeKG")
+```
+
+# Generate Prompts for PQA
+
+```{r pqa-prompts}
+# Generate directory
+pqa_dir = here(save_dir, "PQA_prompts")
+
+# Select diseases of interest
+diseases_for_prompts = c(39579, 39528, 34836)
+
+# Print nodes and calculate degree
+for (disease in diseases_for_prompts) {
+  message("- ", neuroKG_nodes[node_index == disease, node_name], " (", disease, "), ", nrow(neuroKG_edges[x_index == disease]), " edges")
+}
+
+template_text = 'Is there scientific or medical evidence supporting an association between %s and %s? Please rate the following statement on a 5-point Likert scale and provide a rationale based on the available literature: "There is scientific or medical evidence to support an association between %s and %s."
+1 = Strongly Disagree
+2 = Disagree
+3 = Neither Agree nor Disagree
+4 = Agree
+5 = Strongly Agree
+In your response, please explain the reasoning behind your rating and reference any relevant scientific or medical sources (e.g., peer-reviewed studies, clinical guidelines) that support your assessment.
+
+Instructions to the LLM: Output must be valid JSON. Do not include any additional keys or text. Use the following format exactly:
+{
+  "rating": "<1, 2, 3, 4, or 5>",
+  "rationale": "<Your explanation here>"
+}
+'
+
+# Get disease subsets
+disease_prompts = list()
+for (disease in diseases_for_prompts) {
+  disease_edges = neuroKG_edges[x_index == disease]
+  disease_edges = disease_edges[, .(x_index, x_name, y_index, y_name)]
+  disease_edges[, prompt := sprintf(template_text, x_name, y_name, x_name, y_name)]
+  disease_prompts[[disease]] = disease_edges
+
+  # Save to file
+  fwrite(disease_edges, here(pqa_dir, paste0(disease, "_prompts.csv")), encoding = "native")
+}
+
+# Concatenate prompts
+disease_prompts = rbindlist(disease_prompts)
+
+# Save to file
+fwrite(disease_prompts, here(pqa_dir, "all_prompts.csv"), encoding = "native")
+```
+
+Read in PQA results.
+
+```{r pqa-results}
+pqa_results_dir = here(save_dir, "pqa_results", "2025-02-17_01-55-29")
+pqa_random_results_dir = here(save_dir, "pqa_results", "2025-02-18_04-30-27_random")
+
+# Read in results
+pqa_results = fread(here(pqa_results_dir, "PQA_results.csv"))
+pqa_random_results = fread(here(pqa_random_results_dir, "PQA_results.csv"))
+pqa_results[, random := 0]
+pqa_random_results[, random := 1]
+pqa_results = rbind(pqa_results, pqa_random_results)
+
+# Extract reasoning
+pqa_results[, reasoning := str_match(response, "<reasoning>([\\s\\S]*?)</reasoning>")[,2]]
+
+# Get ratings
+pqa_results[, rating := str_extract(response, "(?<=<rating>)\\d+(?=</rating>)")] %>%
+  .[, rating := as.integer(rating)]
+
+# Save to file
+fwrite(pqa_results, here(pqa_results_dir, "PQA_results_processed.csv"))
+
+# Get NA rows
+pqa_results_NA = pqa_results[is.na(rating)]
+pqa_results_plot = pqa_results[!is.na(rating)]
+pqa_results_plot[, rating := factor(rating, levels = c("1","2","3","4","5"))]
+
+# Merge with nodes
+pqa_results_plot = merge(pqa_results_plot, neuroKG_nodes, by.x = "y_index", by.y = "node_index", all.x = T, all.y = F, sort = F)
+pqa_results_plot[random == 1, node_type := "random"]
+
+# Subset to node type
+pqa_results_to_exclude = pqa_results_plot[!(node_type %in% c("gene/protein", "disease", "drug", "exposure", "random"))]
+
+pqa_results_plot = pqa_results_plot[node_type %in% c("gene/protein", "disease", "drug", "exposure", "random")]
+pqa_results_plot[, node_type := factor(node_type, levels = c("random", "disease", "gene/protein", "drug", "exposure"))]
+
+# Compute percentage of edges per node_type and x_name
+pqa_summary = pqa_results_plot[, .(count = .N), by = .(rating, node_type, x_name)]
+pqa_summary[, total_edges := sum(count), by = .(node_type, x_name)]
+pqa_summary[, percentage := (count / total_edges) * 100]
+
+# Convert x_name to factor with correct labels
+pqa_summary$x_name = factor(
+  pqa_summary$x_name,
+  levels = unique(pqa_summary$x_name),
+  labels = c("amyotrophic\nlateral sclerosis",
+             "epilepsy",
+             "multiple\nsclerosis",
+             "Parkinson\ndisease",
+             "bipolar\ndisorder",
+             "major\ndepressive disorder")
+)
+
+# Group ratings into No Evidence (1) and Evidence (2-5)
+pqa_summary %>%
+  .[, evidence_category := ifelse(rating == "1", "No Evidence", "Evidence")] %>%
+  .[, evidence_category := factor(evidence_category, levels = c("No Evidence", "Evidence"))]
+
+# Create a new factor for stacking within the Evidence category
+pqa_summary[, evidence_strength := factor(rating, levels = c("2", "3", "4", "5"))]
+
+# Compute new summary with grouped categories
+pqa_summary_grouped = pqa_summary[, .(count = sum(count)), by = .(evidence_category, evidence_strength, node_type, x_name)]
+pqa_summary_grouped[, total_edges := sum(count), by = .(node_type, x_name)]
+pqa_summary_grouped[, percentage := (count / total_edges) * 100]
+
+# Create a new fill column to differentiate "No Evidence"
+pqa_summary_grouped[, fill_category := ifelse(evidence_category == "No Evidence", "No Evidence", as.character(evidence_strength))]
+
+# Ensure fill_category is a factor with correct levels
+pqa_summary_grouped$fill_category = factor(pqa_summary_grouped$fill_category, levels = c("No Evidence", "2", "3", "4", "5"))
+
+p = ggplot(pqa_summary_grouped, aes(x = evidence_category, y = percentage, fill = fill_category)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+
+  # Labels inside the bar for "Evidence" and large "No Evidence" bars
+  geom_text(data = pqa_summary_grouped[(evidence_category == "Evidence") | ((evidence_category == "No Evidence") & (percentage > 10))],
+            aes(label = count),
+            position = position_stack(vjust = 0.5),
+            size = 3,
+            fontface = "bold", color = "white", check_overlap = TRUE) +
+
+  # Labels above the bar for small "No Evidence" bars
+  geom_text(data = pqa_summary_grouped[(evidence_category == "No Evidence") & (percentage <= 10)],
+            aes(label = count, y = percentage + 8),  # Shift label slightly above
+            size = 3,
+            fontface = "bold", color = "black", check_overlap = TRUE) +
+
+  scale_fill_manual(
+    values = c("No Evidence" = "#50514F",  # Custom color for No Evidence (red shade)
+               "2" = "#02c39a",  # Weak
+               "3" = "#00a896",  # Moderate
+               "4" = "#028090",  # Strong
+               "5" = "#05668d"), # Very Strong
+    breaks = c("2", "3", "4", "5"),
+    labels = c("Weak", "Moderate", "Strong", "Very strong")
+  ) +
+
+  scale_y_continuous(expand = expansion(c(0, 0.2)), # n.breaks = 4,
+                     breaks = c(25, 50, 75, 100),
+                     labels = scales::percent_format(scale = 1)) +
+
+  labs(x = "Evidence", y = "Percentage of edges", fill = "Strength of evidence") +
+
+  facet_grid(x_name ~ node_type, scales = "free") +
+
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.spacing = unit(1.1, "lines"),
+  )
+
+# Save results
+ggsave(here(pqa_results_dir, "PQA_rating_plot.pdf"), p, width = 10, height = 10)
+```
+
+# Bipolar Analysis
+
+```{r bd-analysis}
+bd_dir = here(save_dir, "BD_drug_gene")
+bd_drugs = fread(here(bd_dir, "BD_drugs_from_Maria.csv"))
+bd_drugs[, Risk := factor(Category, levels = c("Recommended", "Use With Caution", "Not Recommended"), c("Low", "Moderate", "High"))]
+
+# For each drug, find all edges in neuroKG
+drug_gene_edges = neuroKG_edges[(x_type == "drug") & (y_type == "gene/protein")]
+bd_drugs_edges = drug_gene_edges[x_name %in% bd_drugs$Drug]
+
+# Create 0/1 matrix of drug-gene interactions
+bd_drugs_matrix = bd_drugs_edges[, .(x_name, y_name)] %>% set_colnames(c("Drug", "Protein")) %>% unique()
+bd_drugs_matrix = dcast(bd_drugs_matrix, Drug ~ Protein, value.var = "Protein", fun.aggregate = length)
+
+# Save to file
+fwrite(bd_drugs_matrix, here(bd_dir, "BD_drugs_matrix.csv"))
+
+# Only keep genes with at least 3 drugs
+bd_drugs_matrix = bd_drugs_matrix[, .SD, .SDcols = c("Drug", names(bd_drugs_matrix[, -1])[colSums(bd_drugs_matrix[, -1]) >= 3])]
+
+# Convert to matrix
+bd_mat = as.matrix(bd_drugs_matrix[, -1])
+rownames(bd_mat) = bd_drugs_matrix[["Drug"]]
+
+# Create annotation column
+annotation_df = data.frame(Risk = bd_drugs$Risk)
+rownames(annotation_df) = bd_drugs$Drug
+annotation_colors = list(
+  Risk = c(
+    "Low" = "#8ac926",
+    "Moderate" = "#ffca3a",
+    "High" = "#ff595e"
+  )
+)
+
+# Create column annotion
+gene_counts = colSums(bd_mat)
+num_drugs = cut(
+  gene_counts,
+  breaks = c(3, 4, 5, 8, 11, Inf),
+  labels = c("(3,4]", "(4,5]", "(5,8]", "(8,11]", ">11"),
+  right = FALSE,        # whether to treat intervals as [ )
+  include.lowest = TRUE # include the lowest value
+)
+col_annotation_df = data.frame(`Drugs` = num_drugs)
+rownames(col_annotation_df) <- colnames(bd_mat)
+annotation_colors_col = list(
+  `Drugs` = c(
+    "(3,4]" = "#ffcdb2",
+    "(4,5]" = "#ffb4a2",
+    "(5,8]" = "#e5989b",
+    "(8,11]" = "#b5838d",
+    ">11"    = "#6d6875"
+  )
+)
+
+# Create the heatmap
+p = pheatmap(
+  bd_mat,
+  color = c("#E0E0E0", "#48639C"),
+  cluster_rows = TRUE,    # cluster the rows
+  cluster_cols = TRUE,    # cluster the columns
+  border_color = "black",
+  annotation_row   = annotation_df,
+  annotation_col = col_annotation_df,
+  annotation_colors = c(annotation_colors, annotation_colors_col),
+  legend = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE
+)
+
+# Save to file
+ggsave(here(bd_dir, "BD_drug_gene_matrix.pdf"), p, width = 12, height = 6)
+ggsave(here(bd_dir, "BD_drug_gene_matrix.svg"), p, width = 12, height = 6)
+ggsave(here(bd_dir, "BD_drug_gene_matrix.png"), p, width = 12, height = 6, dpi=600)
+```

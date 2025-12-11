@@ -1,0 +1,74 @@
+---
+title: Filter Knowledge Graph
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(data.table)
+library(purrr)
+library(magrittr)
+library(here)
+library(ggplot2)
+library(ontologyIndex)
+library(stringr)
+```
+
+To copy the knowledge graph from the PrimeKG project to the relevant directory of the NeuroKG project on O2, run the following lines.
+
+```{bash copy-kg}
+cp -r /n/data1/hms/dbmi/zitnik/lab/users/an252/PrimeKG/datasets/data/kg /n/data1/hms/dbmi/zitnik/lab/users/an252/PROTON/data/primekg
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+primeKG_dir = here("data", "primekg")
+drugKG_dir = here("data", "neurokg", "0_open_targets")
+HPA_dir = here("data", "hpa")
+uberon_dir = here("data", "uberon")
+mondo_dir = here("data", "mondo")
+exo_dir = here("data", "exo")
+neuroKG_dir = here("data", "neurokg")
+```
+
+# Load DrugKG
+
+Load DrugKG, _i.e._, the July 2023 updated version of PrimeKG augmented with edges from the Open Targets database. See [ayushnoori/open-targets-KG](https://github.com/ayushnoori/open-targets-KG) on GitHub.
+
+```{r load-drugKG}
+drugKG_nodes = readRDS(here(drugKG_dir, "kg_nodes.RDS"))
+drugKG_edges = readRDS(here(drugKG_dir, "combined_kg_edges.RDS"))
+
+message("DrugKG Nodes:\t", nrow(drugKG_nodes))
+message("DrugKG Edges:\t", nrow(drugKG_edges) / 2)
+```
+
+# Construct NeuroKG
+
+Construct NeuroKG by combining filtered tables.
+
+```{r combine-tables}
+neuroKG_nodes = drugKG_nodes
+neuroKG_edges = drugKG_edges[(x_index %in% neuroKG_nodes$node_index) & (y_index %in% neuroKG_nodes$node_index)]
+
+message("NeuroKG Nodes:\t", nrow(neuroKG_nodes))
+message("NeuroKG Edges:\t", nrow(neuroKG_edges) / 2)
+
+saveRDS(neuroKG_nodes, here(neuroKG_dir, "1_filter_kg", "neuroKG_nodes.RDS"))
+saveRDS(neuroKG_edges, here(neuroKG_dir, "1_filter_kg", "neuroKG_edges.RDS"))
+```

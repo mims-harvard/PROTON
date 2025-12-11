@@ -1,0 +1,210 @@
+[project]
+name = "proton"
+version = "0.0.1"
+description = "Graph AI generates neurological hypotheses validated in molecular, organoid, and clinical systems."
+authors = [{ name = "Ayush Noori", email = "ayush.noori@sjc.ox.ac.uk" }]
+readme = "README.md"
+keywords = ['python']
+requires-python = ">=3.11,<3.12"
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "bio>=1.8.1",
+    "cellxgene-census>=1.17.0",
+    "fqdn>=1.5.1",
+    "getsequence>=2.2.1",
+    "goatools>=1.4.12",
+    "gseapy>=1.1.10",
+    "igraph>=1.0.0",
+    "isoduration>=20.11.0",
+    "jsonpointer>=3.0.0",
+    "jupyter>=1.1.1",
+    "lab>=8.4",
+    "lifelines>=0.30.0",
+    "lightning-utilities>=0.15.2",
+    "matplotlib-venn>=1.1.2",
+    "nbdime>=4.0.2",
+    "networkx>=3.2.1",
+    "openai>=2.2.0",
+    "openpyxl>=3.1.5",
+    "pqapi>=7.4.0",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "python-dotenv>=1.1.1",
+    "pytorch-lightning>=2.5.5",
+    "rapidfuzz>=3.14.1",
+    "torchdata==0.9.0",
+    "rich>=14.1.0",
+    "scanpy>=1.11.5",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "sympy>=1.14.0",
+    "tiledbsoma>=2.1.1",
+    "tinycss2>=1.4.0",
+    "transformers>=4.57.0",
+    "typer>=0.16.1",
+    "uri-template>=1.3.0",
+    "wandb>=0.22.2",
+    "webcolors>=24.11.1",
+    "polars",
+]
+
+[project.urls]
+Repository = "https://github.com/mims-harvard/PROTON"
+Documentation = "https://zitniklab.hms.harvard.edu/PROTON"
+
+[project.scripts]
+cli = "src.cli.__main__:cli"
+install-dgl = "scripts.install_dgl:main"
+
+[project.optional-dependencies]
+cpu = [
+  "torch==2.3.0",
+  "torchvision",
+  "torchaudio",
+  "torchmetrics",
+  "torchdata==0.9.0",
+  "dgl==2.2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+cu118 = [
+  "torch==2.3.0",
+  "torchvision",
+  "torchaudio",
+  "torchmetrics",
+  "torchdata==0.9.0",
+  "dgl==2.2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+
+[tool.ty.rules]
+unresolved-attribute = "ignore"
+possibly-missing-attribute = "ignore"
+invalid-argument-type = "ignore"
+unresolved-import = "ignore"
+
+
+[tool.uv]
+required-version = ">=0.7.0"
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu118" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu118", extra = "cu118" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu118", extra = "cu118" },
+]
+# DGL will be installed manually from source for macOS ARM64
+# Use: uv run install-dgl or make install-dgl
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[[tool.uv.index]]
+name = "dgl-cpu"
+url = "https://data.dgl.ai/wheels/torch-2.3/repo.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "dgl-cu118"
+url = "https://data.dgl.ai/wheels/torch-2.3/cu118/repo.html"
+format = "flat"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pre-commit>=2.20.0",
+    "tox-uv>=1.11.3",
+    "ty>=0.0.1a16",
+    "ruff>=0.11.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src", "scripts"]
+
+[tool.ty.environment]
+python = "./.venv"
+python-version = "3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+fix = true
+exclude = [
+  "website",
+  "*.ipynb"
+]
+
+[tool.ruff.lint]
+select = [
+    # flake8-2020
+    "YTT",
+    # flake8-bandit
+    "S",
+    # flake8-bugbear
+    "B",
+    # flake8-builtins
+    "A",
+    # flake8-comprehensions
+    "C4",
+    # flake8-debugger
+    "T10",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # mccabe
+    "C90",
+    # pycodestyle
+    "E", "W",
+    # pyflakes
+    "F",
+    # pygrep-hooks
+    "PGH",
+    # pyupgrade
+    "UP",
+    # ruff
+    "RUF",
+    # tryceratops
+    "TRY",
+]
+ignore = [
+    # LineTooLong
+    "E501",
+    # DoNotAssignLambda
+    "E731",
+    # raise-vanilla-args
+    "TRY003",
+    # assert
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+"scripts/install_dgl.py" = ["S603", "S607", "C901"]
+
+[tool.ruff.format]
+preview = true

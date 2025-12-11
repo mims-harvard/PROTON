@@ -1,0 +1,1001 @@
+---
+title: Build Open Targets kG
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+library(stringr)
+
+# relative file paths
+library(here)
+
+# SPARK parsing
+library(sparklyr)
+library(sparklyr.nested)
+```
+
+Define directories.
+
+```{r define-dirs}
+primeKG_dir = here("data", "primekg")
+save_dir = here("data", "neurokg", "0_open_targets")
+
+json_dir = here("data", "open_targets", "23.09", "json")
+parquet_dir = here("data", "open_targets", "23.12", "parquet")
+
+json_folders = list.dirs(json_dir, recursive = FALSE, full.names = FALSE)
+parquet_folders = list.dirs(parquet_dir, recursive = FALSE, full.names = FALSE)
+```
+
+# Read Knowledge Graph
+
+Read PrimeKG knowledge graph. The updated July 2023 version of PrimeKG was saved in `data/PrimeKG/kg`. Briefly, the following steps were followed from the PrimeKG paper:
+> We merged the harmonized primary data resources into a graph. We integrated the various processed, curated datasets and cleaned the graph by dropping NaN and duplicate edges, adding reverse edges, dropping duplicates again, and removing self-loops. This version of the knowledge graph is available in PrimeKG's repository as `kg_raw.csv`.
+
+Note that the version of the graph _before_ taking the largest connected component (LCC) was used, since subsequent scripts add additional nodes to the graph (*e.g.*, informed by single-cell RNA-seq data). Here, the LCC is taken as the final step before the data split.
+
+```{r read-kg}
+primeKG_edges = fread(here(primeKG_dir, "kg", "auxiliary", "kg_raw.csv"))
+
+primeKG_edges[relation == "off-label use", relation := "off_label_use"]
+
+primeKG_nodes = primeKG_edges %>%
+  .[, .(x_id, x_type, x_name, x_source)] %>%
+  unique()
+colnames(primeKG_nodes) = gsub("x", "node", colnames(primeKG_nodes))
+
+# find and consolidate duplicate nodes
+primeKG_nodes[, joint_id := paste(node_id, node_type, sep = "_")]
+dup_list = primeKG_nodes[duplicated(joint_id), joint_id]
+dup_nodes = primeKG_nodes %>%
+  .[joint_id %in% dup_list] %>%
+  .[order(joint_id)]
+
+# separate out duplicate genes and anatomy, manually investigate
+dup_anatomy = dup_nodes[node_type == "anatomy"] %>%
+  .[, final_name := "gall bladder"]
+dup_gene = dup_nodes[node_type == "gene/protein"]
+
+# read HGNC official IDs
+hgnc_set = fread(here("data", "mappings", "hgnc_complete_set.txt"), sep = "\t") %>%
+  .[, entrez_id := as.character(entrez_id)]
+dup_gene = merge(dup_gene, hgnc_set[, .(symbol, entrez_id)], by.x = "node_id", by.y = "entrez_id", all.x = T, all.y = F) %>%
+  setnames("symbol", "final_name")
+
+# combine back
+dup_nodes = rbind(dup_anatomy, dup_gene) %>%
+  .[, node_name := final_name] %>%
+  .[, final_name := NULL] %>%
+  unique()
+
+# replace names as necessary
+for (i in 1:nrow(dup_nodes)) {
+  primeKG_nodes[node_id == dup_nodes[i, node_id] & node_type == dup_nodes[i, node_type], node_name := dup_nodes[i, node_name]]
+  primeKG_edges[x_id == dup_nodes[i, node_id] & x_type == dup_nodes[i, node_type], x_name := dup_nodes[i, node_name]]
+  primeKG_edges[y_id == dup_nodes[i, node_id] & y_type == dup_nodes[i, node_type], y_name := dup_nodes[i, node_name]]
+}
+
+# drop duplicates from nodes
+non_dup_rows = nrow(primeKG_nodes)
+primeKG_nodes = unique(primeKG_nodes)
+message("Removed ", non_dup_rows - nrow(primeKG_nodes), " duplicates")
+
+# make indices
+primeKG_nodes[, node_index := 1:nrow(primeKG_nodes) - 1]
+setcolorder(primeKG_nodes, "node_index")
+
+# add indices to edges
+primeKG_nodes %>% .[, node_string := paste(node_id, node_name, node_source, sep = "_")] %>%
+  .[, x_index := node_index] %>%
+  .[, y_index := node_index]
+primeKG_edges %>%
+  .[, x_string := paste(x_id, x_name, x_source, sep = "_")] %>%
+  .[, y_string := paste(y_id, y_name, y_source, sep = "_")]
+
+# merge back to edges
+primeKG_edges = merge(primeKG_edges, primeKG_nodes[, .(node_string, x_index)], by.x = "x_string", by.y = "node_string", sort = F)
+primeKG_edges = merge(primeKG_edges, primeKG_nodes[, .(node_string, y_index)], by.x = "y_string", by.y = "node_string", sort = F)
+
+# drop merge columns
+primeKG_nodes %>%
+  .[, node_string := NULL] %>%
+  .[, x_index := NULL] %>%
+  .[, y_index := NULL] %>%
+  .[, joint_id := NULL]
+primeKG_edges %>%
+  .[, x_string := NULL] %>%
+  .[, y_string := NULL]
+setcolorder(primeKG_edges, c("relation", "display_relation", "x_index", "x_id", "x_type", "x_name", "x_source", "y_index", "y_id", "y_type", "y_name", "y_source"))
+
+# print node counts
+message("Updated PrimeKG Nodes:\t", nrow(primeKG_nodes))
+message("Updated PrimeKG Edges:\t", nrow(primeKG_edges) / 2)
+
+# save to file
+saveRDS(primeKG_nodes, here(primeKG_dir, "primeKG_nodes.RDS"))
+saveRDS(primeKG_edges, here(primeKG_dir, "primeKG_edges.RDS"))
+
+# rename nodes and edges variables
+kg_nodes = primeKG_nodes
+kg_edges = primeKG_edges
+rm(primeKG_nodes); rm(primeKG_edges)
+```
+
+Establish connection to local Spark instance. See [here](https://spark.rstudio.com/get-started/) for details about Spark. Note that this script requires an installation of Apache Spark, using `spark_install(version = 3.5.0)`.
+
+```{r connect-spark}
+# establish connnection
+sc = spark_connect(master = "local", version = "3.5.0")
+# check dimension with sdf_dim(evd)
+# check schema with sdf_schema(evd)
+# check score distribution with summary(as.factor(df$score))
+```
+
+# ID Mapping
+
+Map Open Targets `target` IDs to KG `gene/protein` IDs.
+
+```{r targets-df}
+# read target annotation
+table_name = "targets"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+targets_df = select(evd, id, approvedName, approvedSymbol) %>%
+  as.data.table() %>%
+  .[!duplicated(approvedSymbol)] %>%
+  merge.data.table(kg_nodes[node_type == "gene/protein"], ., by.x = "node_name", by.y = "approvedSymbol", all.x = F, all.y = F, sort = F) %>%
+  setcolorder(c("id", colnames(kg_nodes)))
+
+message("Genes in Intersection: ", nrow(targets_df))
+```
+
+Map Open Targets `disease` IDs to KG `disease` IDs. The file `mondo_efo_mappings.tsv` (see [source](https://github.com/EBISPOT/efo/blob/master/src/ontology/components/mondo_efo_mappings.tsv)) lists mappings from Monarch Disease Ontology (MONDO) IDs to Experimental Factor Ontology (EFO) IDs.
+
+```{r diseases-df}
+# read disease ID mapping
+disease_mapping = fread(here("data", "mappings", "mondo_efo_mappings.tsv"), sep = "\t", fill = TRUE, header = FALSE)
+colnames(disease_mapping) = c("mondo_id", "efo_id", "mondo_name", "efo_name")
+disease_mapping = disease_mapping %>%
+  .[, mondo_id := gsub("http://purl.obolibrary.org/obo/", "", mondo_id)] %>%
+  # check with disease_mapping[grepl("http", mondo_id)]
+  .[, efo_id := gsub("http://www.ebi.ac.uk/efo/", "", efo_id)] %>%
+  .[, efo_id := gsub("http://www.orpha.net/ORDO/", "", efo_id)] %>%
+  .[, efo_id := gsub("http://purl.obolibrary.org/obo/", "", efo_id)] %>%
+  .[, .(mondo_id, efo_id)]
+
+# read diseases annotation
+table_name = "diseases"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+diseases_df = select(evd, id, name, description) %>%
+  as.data.table() %>%
+  # add MONDO to EFO mapping
+  merge(disease_mapping, by.x = "id", by.y = "efo_id", all.x = T, all.y = F) %>%
+  .[, combined_id := id] %>%
+  .[!is.na(mondo_id), combined_id := mondo_id] %>%
+  .[, mondo_id := NULL] %>%
+  setnames("combined_id", "mondo_id") %>%
+  .[grepl("MONDO", mondo_id), ] %>%
+  .[, node_id := sub("MONDO_", "", mondo_id)] %>%
+  .[, node_id := sub("^0+", "", node_id)] %>%
+  merge(kg_nodes[node_type == "disease"], ., by = "node_id", all.x = F, all.y = F, sort = F) %>%
+  .[!duplicated(node_id)] %>%
+  setcolorder(c("id", colnames(kg_nodes)))
+
+message("Diseases in Intersection: ", nrow(diseases_df))
+```
+
+Map Open Targets ChEMBL `drug` IDs to KG `drug` IDs. The file `drug-mappings.tsv` (see [source](https://github.com/iit-Demokritos/drug_id_mapping/blob/main/drug-mappings.tsv)) lists thousands of known drugs and IDs available in drug databases. Please see [iit-Demokritos/drug_id_mapping](https://github.com/iit-Demokritos/drug_id_mapping) for more information.
+
+```{r drugs-df}
+# read drug ID mapping
+drug_mapping = fread(here("data", "mappings", "drug-mappings.tsv"), sep = "\t", na.strings = "null") %>%
+  .[, .(drugbankId, chembl_id)] %>%
+  unique() %>%
+  .[!(is.na(drugbankId) | is.na(chembl_id))]
+drug_df = merge(kg_nodes[node_type == "drug"], drug_mapping, by.x = "node_id", by.y = "drugbankId", all.x = F, all.y = F)
+
+# filter by hand by searching ChEMBL database
+# see drug_df[node_id %in% drug_df[duplicated(node_id), node_id]][order(node_id)]
+# manually validated at https://www.ebi.ac.uk/chembl/ with all.x = F
+chembl_to_drop = c("CHEMBL440464", "CHEMBL1530", "CHEMBL8663", "CHEMBL261850", "CHEMBL148530", "CHEMBL599035", "CHEMBL1650559;")
+drug_df = drug_df[!(chembl_id %in% chembl_to_drop)] %>%
+  setnames("chembl_id", "id")
+message("Drugs in KG: ", nrow(kg_nodes[node_type == "drug"]))
+message("Drugs in Mapping Table: ", nrow(drug_df))
+
+# read drugs annotation
+table_name = "molecule"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+ot_drugs = select(evd, id, name, description) %>%
+  as.data.table()
+drug_df = merge.data.table(drug_df, ot_drugs, by = "id", all.x = F, all.y = F, sort = F) %>%
+  setcolorder(c("id", colnames(kg_nodes)))
+
+message("Drugs in Intersection: ", nrow(drug_df))
+```
+
+Map Open Targets HPO `phenotype` IDs to KG `effect/phenotype` IDs.
+
+```{r pheno-df}
+# construct effect and phenotype data frame
+pheno_df = kg_nodes %>%
+  .[node_type == "effect/phenotype"] %>%
+  # see max(nchar(pheno_df$node_id))
+  .[, id := str_pad(node_id, width = 7, side = "left", pad = "0")] %>%
+  .[, id := paste0("HP_", id)] %>%
+  setcolorder("id")
+
+# get disease and phenotype IDs
+disease_pheno_id = c(diseases_df$id, pheno_df$id)
+```
+
+# Construct KG Edges
+
+Functions to construct KG edges from processed Open Targets data tables.
+
+```{r construct-edges}
+type_switch = function(type_x_or_y) {
+  type_key = switch(
+    type_x_or_y,
+    "gene" = list("targetId", targets_df),
+    "disease" = list("diseaseId", diseases_df),
+    "drug" = list("drugId", drug_df),
+    "phenotype" = list("phenotypeId", pheno_df)
+  )
+  return(type_key)
+}
+
+construct_edges = function(evidence_df, evidence_source,
+                           type_x = "gene", type_y = "disease",
+                           relation_label = "disease_protein", display_relation_label = "associated with") {
+
+  message("Constructing ", type_x, "-", type_y, " edges from ", evidence_source, " with ", nrow(evidence_df), " rows")
+
+  # check for disease and phenotype ID mixing
+  if((type_x == "gene" & type_y == "disease") & !is.null(relation_label)) {
+
+    pheno_count = sum(grepl("HP", evidence_df$diseaseId))
+
+    if(pheno_count > 0) {
+
+      message("Identified ", pheno_count, " HPO phenotypes, analyzing separately from diseases")
+      message("")
+
+      # since phenotypes and diseases are combined, manually construct edge types
+      evidence_pheno_df = evidence_df %>%
+        .[diseaseId %in% pheno_df$id] %>%
+        .[, .(targetId, diseaseId)] %>%
+        setnames("diseaseId", "phenotypeId")
+
+      evidence_disease_df = evidence_df %>%
+        .[diseaseId %in% diseases_df$id] %>%
+        .[, .(targetId, diseaseId)]
+
+      # construct edges for phenotypes and diseases separately
+      evidence_pheno_df = construct_edges(evidence_pheno_df, evidence_source, "gene", "phenotype", "phenotype_protein", "associated with") %>%
+        setnames("y_phenotype", "y_disease_phenotype")
+      message("")
+      evidence_disease_df = construct_edges(evidence_disease_df, evidence_source, "gene", "disease", "disease_protein", "associated with") %>%
+        setnames("y_disease", "y_disease_phenotype")
+
+      # return combined data frame
+      edge_df = rbind(evidence_pheno_df, evidence_disease_df)
+      message("")
+      edge_types = paste0(unique(edge_df$relation), collapse = '", "')
+      message("Constructed ", nrow(edge_df), ' edges of types "', edge_types, '"')
+      return(edge_df)
+    }
+
+  }
+
+  # if needed, add relation label
+  if(!is.null(relation_label)) {
+    evidence_df = evidence_df %>%
+      .[, relation := relation_label] %>%
+      .[, display_relation := display_relation_label]
+    message("Adding edge type information: ", relation_label, " (", display_relation_label, ")")
+
+  } else {
+    message('Using existing edge type information in column "relation"')
+  }
+
+  # convert arguments to mapping tables
+  type_switch_x = type_switch(type_x)
+  key_x = type_switch_x[[1]]; table_x = type_switch_x[[2]]
+  type_switch_y = type_switch(type_y)
+  key_y = type_switch_y[[1]]; table_y = type_switch_y[[2]]
+  message("Mapping ", type_x, " to ", '"', key_x, '" and ', type_y, " to ", '"', key_y, '"')
+
+  # construct x and y labels
+  x_label = paste0("x_", type_x)
+  y_label = paste0("y_", type_y)
+
+  # construct KG edges
+  edge_df = evidence_df %>%
+    .[, .SD, .SDcols = c(key_x, key_y, "relation", "display_relation")] %>%
+    merge(table_x[, .(id, node_index)], by.x = key_x, by.y = "id", all.x = T, all.y = F) %>%
+    merge(table_y[, .(id, node_index)], by.x = key_y, by.y = "id", all.x = T, all.y = F) %>%
+    setnames(c(key_x, "node_index.x", key_y, "node_index.y"), c(x_label, "x_index", y_label, "y_index")) %>%
+    setcolorder(c("relation", "display_relation", x_label, "x_index", y_label, "y_index")) %>%
+    unique()
+
+  # note that the final unique may cause a discrepancy between Open Targets rows and
+  # KG edges constructed, since concordant pieces of evidence are combined
+
+  if(!is.null(relation_label)) {
+    message("Constructed ", nrow(edge_df), ' edges of type "', relation_label, '"')
+  } else{
+    edge_types = paste0(unique(edge_df$relation), collapse = '", "')
+    message("Constructed ", nrow(edge_df), ' edges of types "', edge_types, '"')
+  }
+
+  return(edge_df)
+
+}
+```
+
+# Analyze Evidence
+
+Construct edges based on Open Targets [evidence sources](https://platform-docs.opentargets.org/evidence). From Open Targets:
+> "Every event or set of events pinpointing a target as a potential causal gene or protein for a disease, represents the unit of information, most often referred as evidence. Within Open Targets, a series of pipelines ensure information is retrieved from their sources and standardised in a way that can be immediately applied to answer drug development queries. All evidence is mapped to the reference target entity identifier (Ensembl gene) and disease or phenotype identifier (experimental factor ontology, EFO), as well as other reference controlled vocabularies and ontologies when appropriate. Evidence is also reviewed to minimise the presence of duplicates within the same data source."
+
+```{r list-sources}
+evidence_sources = here(json_dir, "evidence") %>%
+  list.dirs(full.names = F) %>%
+  gsub("sourceId=", "", .) %>%
+  .[. != ""]
+
+edge_types = unique(kg_edges[, .(relation, display_relation, x_type, y_type)])
+```
+
+### Cancer Biomarkers
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#cancer-biomarkers). Cancer Biomarkers will be tricky to construct binary edges from, since each row represents information about biomarkers of drug sensitivity, resistance, and toxicity for drugs targeting specific targets in cancer. This could be useful for constructing logical queries, though!
+
+```{r cancer_biomarkers}
+# 684 / 727 associations with drug, gene, and disease representations in the KG
+# final edges: 684
+table_name = "evidence/sourceId=cancer_biomarkers"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+cancer_biomarkers_df = evd %>%
+  select(id, drugId, targetId, diseaseId, biomarkerName, drugResponse, confidence) %>%
+  as.data.table() %>%
+  # remove generic drug responses: EFO_0020001 and GO_GO_0042493
+  .[!is.na(drugId)] %>%
+  .[drugId %in% drug_df$id] %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% diseases_df$id]
+
+# message("Cancer Biomarkers: ", nrow(cancer_biomarkers_df))
+```
+
+### Cancer Gene Census
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#cancer-gene-census).
+
+```{r cancer_gene_census}
+# https://platform-docs.opentargets.org/evidence#cancer-gene-census
+# 71791 / 76289 associations with gene and disease representations in the KG
+# of those, score distribution is:
+#   0.25   0.5  0.75     1
+#   5943 30416 30151  5281
+# final edges: 35432
+table_name = "evidence/sourceId=cancer_gene_census"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+cancer_gene_census_df = evd %>%
+  select(id, targetId, diseaseId, studyId, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5, indicating that the gene is mutated more frequently in that particular disease compared to other diseases, and that mutations in the gene occur more frequently than in other genes of similar length in the same disease
+  .[score > 0.5]
+
+cancer_gene_census_df = construct_edges(cancer_gene_census_df, "Cancer Gene Census", "gene", "disease", "disease_protein", "associated with")
+```
+
+### ChEMBL
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#chembl).
+
+```{r chembl}
+# 410317 / 625734 associations with drug, gene, and disease representations in the KG
+# of those, score distribution is:
+#   0.025   0.05    0.1    0.2   0.35    0.5    0.7      1
+#      31   6420  83679 133927   1407    254  77690 106909
+# final edges: 403866
+table_name = "evidence/sourceId=chembl"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+chembl_df = evd %>%
+  select(id, drugId, targetId, diseaseId, clinicalPhase, clinicalStatus, score, studyStopReason, studyStartDate) %>%
+  as.data.table() %>%
+  .[drugId %in% drug_df$id] %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% diseases_df$id] %>%
+  # take score > 0.5
+  # Phase 1 = 0.1, Phase 2 = 0.2, Phase 3 = 0.7, and Phase 4 = 1
+  # scores are then down-weighted if the trial stops early for "negative result" or "safety/side effects"
+  # construct edges of six edge types: clinical_evidence_0.1, clinical_evidence_0.2, etc.
+  .[score > 0.05] %>%
+  .[, clinicalPhase := as.integer(clinicalPhase)]
+
+chembl_drug_disease_df = copy(chembl_df) %>%
+  .[, .(score, drugId, diseaseId)] %>%
+  .[, .(score = mean(score)), by = c("drugId", "diseaseId")] %>%
+  .[score < 0.5, relation := "weak_clinical_evidence"] %>%
+  .[score < 0.5, display_relation := "clinical candidate"] %>%
+  .[score >= 0.5, relation := "strong_clinical_evidence"] %>%
+  .[score >= 0.5, display_relation := "clinical candidate"] %>%
+  .[score == 1, relation := "indication"] %>%
+  .[score == 1, display_relation := "indication"]
+
+chembl_drug_gene_df = copy(chembl_df) %>%
+  .[, .(drugId, targetId)] %>%
+  unique() %>%
+  .[, relation := "drug_protein"] %>%
+  .[, display_relation := "target"]
+
+chembl_drug_disease_df = construct_edges(chembl_drug_disease_df, "ChEMBL", "drug", "disease", NULL, NULL)
+message("")
+chembl_drug_gene_df = construct_edges(chembl_drug_gene_df, "ChEMBL", "drug", "gene", "drug_protein", "target")
+```
+
+### ClinGen
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#clingen).
+
+```{r clingen}
+# 2039 / 2183 associations with gene and disease representations in the KG
+# of those, score distribution is:
+#   0.01  0.5    1
+#    506  234 1299
+# final edges: 1299
+table_name = "evidence/sourceId=clingen"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+clingen_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSourceId, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5
+  .[score > 0.5]
+
+clingen_df = construct_edges(clingen_df, "ClinGen", "gene", "disease", "disease_protein", "associated with")
+```
+
+### Project Score
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#project-score).
+
+```{r crispr}
+# 1838 / 1838 associations with gene and disease representations in the KG
+# already filtered for score > 0.415
+table_name = "evidence/sourceId=crispr"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+crispr_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id]
+
+crispr_df = construct_edges(crispr_df, "Project Score", "gene", "disease", "disease_protein", "associated with")
+```
+
+# CRISPR Screens
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#crispr-screens). ssociations are genome-wide CRISPRi/a/KO screens from CRISPRbrain, a database for functional genomics screens in differentiated human brain cell types. There are edges from the following cell types: glutamatergic neuron, astrocyte, microglia, hematopoietic stem and progenitor cell.
+
+Here, scores are defined based on Tianet al.(2021) in Nature Neuroscience as the product of the phenotype score and -log10(p-value). We take the average FC across all cell types for each unique (gene, disease) pair.
+
+```{r crispr_screen}
+# 21721 / 24907 associations with gene and disease representations in the KG
+# of those, 7088 have a score == 1
+# these include 1830 upregulated (FC > 0) and 5258 downregulated (FC < 0) edges
+table_name = "evidence/sourceId=crispr_screen"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+crispr_screen_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score, log2FoldChangeValue, cellType, crisprScreenLibrary) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% diseases_df$id] %>%
+  .[, .(score, log2FoldChangeValue, targetId, diseaseId)] %>%
+  .[, .(score = mean(score), logFC = mean(log2FoldChangeValue)), by = c("targetId", "diseaseId")] %>%
+  # see hist(crispr_screen_df$score)
+  .[score > 0.5] %>%
+  .[logFC != 0] %>%
+  .[logFC < 0, relation := "disease_protein_negative"] %>%
+  .[logFC < 0, display_relation := "expression downregulated"] %>%
+  .[logFC > 0, relation := "disease_protein_positive"] %>%
+  .[logFC > 0, display_relation := "expression upregulated"]
+
+crispr_screen_df = construct_edges(crispr_screen_df, "CRISPR Screens", "gene", "disease", NULL, NULL)
+```
+
+
+# Europe PMC
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#europepmc).
+
+```{r europepmc}
+# excluded because not direct evidence
+# associations are derived from target-disease co-occurrence analysis
+# in the Europe PMC literature using named entity recognition
+table_name = "evidence/sourceId=europepmc"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+```
+
+# ClinVar
+
+See documentation for germline mutations [here](https://platform-docs.opentargets.org/evidence#clinvar) and documentation for somatic mutations [here](https://platform-docs.opentargets.org/evidence#clinvar-somatic).
+
+```{r clinvar}
+# total edges: 2895491
+# excluded because germline variants
+table_name = "evidence/sourceId=eva"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+
+# total edges: 17099
+# excluded because ssomatic variants
+table_name = "evidence/sourceId=eva_somatic"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+# eva_somatic_df = evd %>%
+#   select(id, variantId, targetId, diseaseId, variantRsId, variantHgvsId, targetFromSourceId, diseaseFromSource, score) %>%
+#   as.data.table()
+```
+
+# Expression Atlas
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#expression-atlas).
+
+```{r expression_atlas}
+# 197107 / 230893 associations with gene and disease representations in the KG
+# after collapsing, 132219 unique edges
+# these include 66706 upregulated (FC > 0) and 65513 downregulated (FC < 0) edges
+# final edges: 132219
+table_name = "evidence/sourceId=expression_atlas"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+expression_atlas_df = evd %>%
+  select(id, targetId, diseaseId, studyId, contrast, log2FoldChangeValue, log2FoldChangePercentileRank, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% diseases_df$id] %>%
+  # collapse by (gene, disease) pair
+  .[, .(targetId, diseaseId, log2FoldChangeValue)] %>%
+  .[, .(logFC = mean(log2FoldChangeValue)), by = c("targetId", "diseaseId")] %>%
+  # .[, direction := "downregulated"] %>%
+  # .[logFC > 0, direction := "upregulated"]
+  # set threshold of log2(2) = 1
+  .[abs(logFC) > 1] %>%
+  .[logFC < 0, relation := "disease_protein_negative"] %>%
+  .[logFC < 0, display_relation := "expression downregulated"] %>%
+  .[logFC >= 0, relation := "disease_protein_positive"] %>%
+  .[logFC >= 0, display_relation := "expression upregulated"]
+
+expression_atlas_df = construct_edges(expression_atlas_df, "Expression Atlas", "gene", "disease", NULL, NULL)
+```
+
+# Gene Burden
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#gene-burden).
+
+```{r gene_burden}
+# 7540 / 27381 associations with gene and disease/phenotype representations in the KG
+# 371 diseases represented
+# final edges: 7540, 1032 phenotypes and 6508 diseases
+table_name = "evidence/sourceId=gene_burden"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+gene_burden_df = evd %>%
+  select(id, targetId, diseaseId, studyId, score, oddsRatio, pValueExponent, studyCases) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id]
+
+# construct edges for phenotypes and diseases separately
+gene_burden_df = construct_edges(gene_burden_df, "Gene Burden", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Gene2Phenotype
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#gene2phenotype).
+
+```{r gene2phenotype}
+# 2195 / 3011 associations with gene and disease/phenotype representations in the KG
+# final edges: 1992
+table_name = "evidence/sourceId=gene2phenotype"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+gene2phenotype_df = evd %>%
+  select(id, targetId, diseaseId, studyId, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  # .[diseaseId %in% diseases_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5, indicating strong evidence, both RD/IF, or definitive evidence
+  .[score > 0.5]
+
+# construct edges for phenotypes and diseases separately
+gene2phenotype_df = construct_edges(gene2phenotype_df, "Gene2Phenotype", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Genomics England PanelApp
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#genomics-england-panelapp).
+
+```{r genomics_england}
+# 22724 / 31394 associations with gene and disease representations in the KG
+# final edges: 20324
+table_name = "evidence/sourceId=genomics_england"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+genomics_england_df = evd %>%
+  select(id, targetId, diseaseId, score, studyId, studyOverview) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5, indicating evidence from 3 or more unrelated families
+  .[score > 0.5]
+
+genomics_england_df = construct_edges(genomics_england_df, "Genomics England PanelApp", "gene", "disease", "disease_protein", "associated with")
+```
+
+# IMPC
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#impc).
+
+```{r impc}
+# excluded because non-human
+# 1032845 genotype-phenotype associations are from the
+# International Mouse Phenotypes Consortium
+table_name = "evidence/sourceId=impc"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+```
+
+# IntOGen
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#intogen).
+
+```{r intogen}
+# 4296 / 4359 associations with gene and disease representations in the KG
+# final edges: 4296
+table_name = "evidence/sourceId=intogen"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+intogen_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id]
+
+intogen_df = construct_edges(intogen_df, "IntOGen", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Orphanet
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#orphanet).
+
+```{r orphanet}
+# 5156 / 6342 associations with gene and disease representations in the KG
+# final edges: 5146
+table_name = "evidence/sourceId=orphanet"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+orphanet_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, variantFunctionalConsequenceId, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5, meaning genetic association has been assessed
+  .[score > 0.5]
+
+# construct edges for phenotypes and diseases separately
+orphanet_df = construct_edges(orphanet_df, "Orphanet", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Open Targets Genetics
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#open-targets-genetics).
+
+```{r ot_genetics_portal}
+# total edges: 781862
+# excluded because genetic variants
+table_name = "evidence/sourceId=ot_genetics_portal"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+# ot_genetics_portal_df = evd %>%
+#   # select(id, variantId, targetId, diseaseId, variantRsId, variantFunctionalConsequenceId, targetFromSourceId, diseaseFromSource, studyId, score, oddsRatio, pValueExponent, studySampleSize, publicationFirstAuthor, publicationYear) %>%
+#   select(id, variantId, targetId, diseaseId, score) %>%
+#   as.data.table()
+```
+
+# PROGENy
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#progeny).
+
+```{r progeny}
+# 378 / 378 associations with gene and disease representations in the KG
+# final edges: 378
+table_name = "evidence/sourceId=progeny"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+progeny_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score) %>%
+  as.data.table() %>%
+  # check for phenotypes with sum(grepl("HP", progeny_df$diseaseId)), for example
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% diseases_df$id]
+
+progeny_df = construct_edges(progeny_df, "PROGENy", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Reactome
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#reactome).
+
+```{r reactome}
+# 9897 / 10095 associations with gene and disease representations in the KG
+# final edges: 9897
+table_name = "evidence/sourceId=reactome"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+reactome_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, targetModulation, reactionId, reactionName, score) %>%
+  as.data.table() %>%
+  # check for phenotypes with sum(grepl("HP", reactome_df$diseaseId))
+  .[targetId %in% targets_df$id] %>%
+  # .[diseaseId %in% diseases_df$id]
+  .[diseaseId %in% disease_pheno_id]
+
+# construct edges for phenotypes and diseases separately
+reactome_df = construct_edges(reactome_df, "Reactome", "gene", "disease", "disease_protein", "associated with")
+```
+
+# SLAPenrich
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#slapenrich).
+
+```{r slapenrich}
+# 72272 / 72440 associations with gene and disease representations in the KG
+# final edges: 72272
+table_name = "evidence/sourceId=slapenrich"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+slapenrich_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id]
+
+slapenrich_df = construct_edges(slapenrich_df, "SLAPenrich", "gene", "disease", "disease_protein", "associated with")
+```
+
+# Gene Signatures
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#gene-signatures).
+
+```{r sysbio}
+# 309 / 389 associations with gene and disease representations in the KG
+# final edges: 309
+table_name = "evidence/sourceId=sysbio"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+sysbio_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  # .[diseaseId %in% diseases_df$id]
+  .[diseaseId %in% disease_pheno_id]
+
+# construct edges for phenotypes and diseases separately
+sysbio_df = construct_edges(sysbio_df, "Gene Signatures", "gene", "disease", "disease_protein", "associated with")
+```
+
+# UniProt Literature
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#uniprot-literature).
+
+```{r uniprot_literature}
+# 2948 / 4135 associations with gene and disease representations in the KG
+# final edges: 2857
+table_name = "evidence/sourceId=uniprot_literature"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+uniprot_literature_df = evd %>%
+  select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, targetModulation, score) %>%
+  as.data.table() %>%
+  .[targetId %in% targets_df$id] %>%
+  .[diseaseId %in% disease_pheno_id] %>%
+  # take score > 0.5, indicating high confidence in association
+  .[score > 0.5]
+
+# construct edges for phenotypes and diseases separately
+uniprot_literature_df = construct_edges(uniprot_literature_df, "UniProt Literature", "gene", "disease", "disease_protein", "associated with")
+```
+
+# UniProt Variants
+
+See documentation [here](https://platform-docs.opentargets.org/evidence#uniprot-variants).
+
+```{r uniprot_variants}
+# total edges: 26258
+# excluded because genetic variants
+table_name = "evidence/sourceId=uniprot_variants"
+evidence_path = here(json_dir, table_name)
+# evd = spark_read_json(sc, path = evidence_path)
+# uniprot_variants_df = evd %>%
+#   select(id, targetId, diseaseId, targetFromSourceId, diseaseFromSource, variantRsId, variantFunctionalConsequenceId, score) %>%
+#   as.data.table() %>%
+#   .[targetId %in% targets_df$id] %>%
+#   .[diseaseId %in% diseases_df$id]
+```
+
+# Analyze Associations
+
+From [Open Targets](https://platform-docs.opentargets.org/associations):
+> "Each unique target-disease pair in the Open Targets Platform is defined as an association. For example, while there might be several pieces of evidence referring to CFTR and Cystic fibrosis from multiple sources, one single association contextualises all this information within the Platform. Also, since multiple pieces of evidence might refer to the same or similar associations, the Platform undertakes a series of steps to quantify their relative strength for a given association."
+
+We construct edges based on evidence but not associations (whether direct or indirect), since associations are less granular than evidence.
+
+```{r parse-associations}
+# read disease-to-phenotype associations
+table_name = "diseaseToPhenotype"
+evidence_path = here(json_dir, table_name)
+evd = spark_read_json(sc, path = evidence_path)
+disease_pheno_df = select(evd, disease, phenotype) %>%
+  as.data.table() %>%
+  .[disease %in% diseases_df$id] %>%
+  .[phenotype %in% pheno_df$id] %>%
+  merge(diseases_df[, .(id, node_index)], by.x = "disease", by.y = "id", all.x = T, all.y = F) %>%
+  merge(pheno_df[, .(id, node_index)], by.x = "phenotype", by.y = "id", all.x = T, all.y = F) %>%
+  setnames(c("node_index.x", "node_index.y"), c("disease_index", "phenotype_index"))
+
+open_targets_assoc = c(
+  disease_pheno_df[, paste(disease_index, phenotype_index, sep = "_")],
+  disease_pheno_df[, paste(phenotype_index, disease_index, sep = "_")]
+) %>% unique()
+
+kg_assoc = kg_edges %>%
+  .[(x_type == "disease" & y_type == "effect/phenotype") | (y_type == "disease" & x_type == "effect/phenotype")] %>%
+    .[, paste(x_index, y_index, sep = "_")] %>%
+    unique()
+
+message("Open Targets disease-phenotype associations in KG: ", sum(open_targets_assoc %in% kg_assoc), " / ", length(open_targets_assoc))
+```
+
+Disconnect from the Spark instance.
+
+```{r disconnect-spark}
+spark_disconnect(sc)
+```
+
+# Build KG
+
+Combine all edges to build KG.
+
+```{r build-kg}
+open_targets_edges = rbind(cancer_gene_census_df, chembl_drug_disease_df, chembl_drug_gene_df, clingen_df, crispr_df, crispr_screen_df, expression_atlas_df, gene_burden_df, gene2phenotype_df, genomics_england_df, intogen_df, orphanet_df, progeny_df, reactome_df, slapenrich_df, sysbio_df, uniprot_literature_df, fill = T)
+
+# merge with node table
+open_targets_edges = open_targets_edges %>%
+  merge(kg_nodes, by.x = "x_index", by.y = "node_index", all.x = T, all.y = F, sort = F) %>%
+  setnames(c("node_id", "node_type", "node_name", "node_source"), c("x_id", "x_type", "x_name", "x_source")) %>%
+  merge(kg_nodes, by.x = "y_index", by.y = "node_index", all.x = T, all.y = F, sort = F) %>%
+  setnames(c("node_id", "node_type", "node_name", "node_source"), c("y_id", "y_type", "y_name", "y_source")) %>%
+  .[, .SD, .SDcols = colnames(kg_edges)] %>%
+  unique()
+
+# find and remove duplicates
+open_targets_edges[, dup := paste(x_index, y_index, sep = "_")]
+dup_list = open_targets_edges[duplicated(dup), dup]
+
+# subset duplicates
+dup_edges = open_targets_edges %>%
+  .[dup %in% dup_list] %>%
+  .[order(x_index, y_index, relation)]
+
+# remove from original graph
+open_targets_edges = open_targets_edges[!(dup %in% dup_list)]
+
+# filter duplicate edges
+dup_edges = dup_edges %>%
+  .[, relation := factor(relation, levels = c("disease_protein_positive", "disease_protein_negative", "disease_protein"))] %>%
+  .[order(x_index, y_index, relation)] %>%
+  .[!duplicated(dup)] %>%
+  .[, relation := as.character(relation)]
+
+# add back duplicated edges
+open_targets_edges = open_targets_edges %>%
+  rbind(dup_edges) %>%
+  .[, dup := NULL]
+
+# calculate edge statistics
+edge_stats = open_targets_edges %>%
+  .[, .(count = .N), by = c("relation", "display_relation")] %>%
+  .[order(-count)]
+
+saveRDS(open_targets_edges, here(save_dir, "open_targets_edges.RDS"))
+```
+
+Add to PrimeKG.
+
+```{r merge-primeKG}
+# create reverse edges
+rev_edges = copy(open_targets_edges) %>%
+  setnames(c("relation", "display_relation", "x_index", "x_id", "x_type", "x_name", "x_source", "y_index", "y_id", "y_type", "y_name", "y_source"), c("relation", "display_relation", "y_index", "y_id", "y_type", "y_name", "y_source", "x_index", "x_id", "x_type", "x_name", "x_source")) %>%
+  setcolorder(colnames(kg_edges))
+
+# merge with PrimeKG
+new_kg_edges = rbind(kg_edges, open_targets_edges, rev_edges)
+
+# check for duplicates
+new_kg_edges[, dup := paste(x_index, y_index, sep = "_")]
+dup_list = new_kg_edges[duplicated(dup), dup]
+dup_edges = new_kg_edges %>%
+  .[dup %in% dup_list] %>%
+  .[order(x_index, y_index)]
+
+# remove duplicates
+new_kg_edges = new_kg_edges[!(dup %in% dup_list)]
+undup_edges = unique(dup_edges)
+new_kg_edges = rbind(new_kg_edges, undup_edges) %>%
+  .[, dup := NULL]
+
+message("KG nodes: ", nrow(kg_nodes))
+message("KG edges: ", nrow(new_kg_edges))
+saveRDS(kg_nodes, here(save_dir, "kg_nodes.RDS"))
+saveRDS(new_kg_edges, here(save_dir, "combined_kg_edges.RDS"))
+```
+
+# Compare KGs
+
+Compare the updated July 2023 version of PrimeKG (with additional edges from Open Targets) to the original published version of PrimeKG from [Harvard Dataverse](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IXA7BM).
+
+```{r edge-comp}
+# read original KG before taking LCC
+original_KG = fread(here(primeKG_dir, "original", "auxiliary", "kg_raw.csv"))
+
+# compute edge counts by type
+edge_counts = new_kg_edges[, .N, by = c("relation", "display_relation")]
+original_edge_counts = original_KG[, .N, by = c("relation", "display_relation")] %>%
+  .[relation == "off-label use", relation := "off_label_use"]
+
+# identify difference
+edge_comp = merge(edge_counts, original_edge_counts, by = c("relation", "display_relation"), all = T) %>%
+  setnames(c("N.x", "N.y"), c("N_new", "N_original")) %>%
+  .[, N_new := N_new/2] %>%
+  .[, N_original := N_original/2] %>%
+  .[, delta := N_new - N_original] %>%
+  .[order(-delta)]
+
+fwrite(edge_comp, here(primeKG_dir, "edge_count_comparison.csv"))
+```
